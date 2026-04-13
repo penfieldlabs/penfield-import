@@ -1,0 +1,32 @@
+# Local test data and artifacts (keep tests/*.py in repo)
+test_vaults/
+tests/__pycache__/
+.pytest_cache/
+
+# Import checkpoint and report (written to vault directory)
+.penfield_import_checkpoint.json
+.penfield_import_checkpoint.tmp
+.penfield_import_report.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info
+dist/
+build/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
