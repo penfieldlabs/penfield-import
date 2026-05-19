@@ -1383,6 +1383,74 @@ def build_relationship_list(
     return result
 
 
+_CONSECUTIVE_500_LIMIT = 3
+
+
+def _create_relationships_individually(
+    client: PenfieldClient,
+    batch: list[tuple[str, dict[str, Any]]],
+    checkpoint: Checkpoint,
+    checkpoint_path: Path,
+) -> None:
+    """Create relationships one at a time after a bulk batch fails.
+
+    Uses the bulk endpoint with single-item arrays so that duplicates
+    return 409 (the bulk endpoint bypasses the validator and hits the DB
+    constraint directly).  This avoids body-sniffing the 400 response
+    from the single-create validator path.
+    """
+    created = 0
+    duplicates = 0
+    failed = 0
+    consecutive_500s = 0
+
+    for key, payload in batch:
+        if key in checkpoint.relationships_done:
+            continue
+
+        try:
+            client.create_relationships_bulk([payload])
+            checkpoint.relationships_done.add(key)
+            if key in checkpoint.failed_relationships:
+                checkpoint.failed_relationships.remove(key)
+            created += 1
+            consecutive_500s = 0
+        except APIError as e:
+            if e.status_code == 409:
+                checkpoint.relationships_done.add(key)
+                if key in checkpoint.failed_relationships:
+                    checkpoint.failed_relationships.remove(key)
+                duplicates += 1
+                consecutive_500s = 0
+            elif e.status_code >= 500:
+                consecutive_500s += 1
+                if key not in checkpoint.failed_relationships:
+                    checkpoint.failed_relationships.append(key)
+                failed += 1
+                if consecutive_500s >= _CONSECUTIVE_500_LIMIT:
+                    remaining = [k for k, _ in batch if k not in checkpoint.relationships_done]
+                    logger.warning(
+                        "%d consecutive server errors — aborting batch, %d items deferred to next resume",
+                        _CONSECUTIVE_500_LIMIT, len(remaining),
+                    )
+                    existing = set(checkpoint.failed_relationships)
+                    for k in remaining:
+                        if k not in existing:
+                            checkpoint.failed_relationships.append(k)
+                    checkpoint.save(checkpoint_path)
+                    break
+            else:
+                logger.error("Failed to create relationship %s: %s", key, e)
+                if key not in checkpoint.failed_relationships:
+                    checkpoint.failed_relationships.append(key)
+                failed += 1
+                consecutive_500s = 0
+
+        checkpoint.save(checkpoint_path)
+
+    logger.info("Batch fallback: %d created, %d duplicates, %d failed", created, duplicates, failed)
+
+
 def run_relationships_phase(
     notes: list[ParsedNote],
     client: PenfieldClient,
@@ -1418,20 +1486,24 @@ def run_relationships_phase(
         try:
             client.create_relationships_bulk(payloads)
             checkpoint.relationships_done.update(keys)
-            # Clear any prior failure records for these keys
             checkpoint.failed_relationships = [
                 k for k in checkpoint.failed_relationships if k not in keys
             ]
+            checkpoint.save(checkpoint_path)
         except APIError as e:
-            logger.error("Relationship batch %d failed: %s", batch_idx, e)
-            # Don't add to relationships_done — they will be retried on resume.
-            # Track unique failures for the final report.
-            existing = set(checkpoint.failed_relationships)
-            for key in keys:
-                if key not in existing:
-                    checkpoint.failed_relationships.append(key)
-
-        checkpoint.save(checkpoint_path)
+            if e.status_code == 409 or e.status_code >= 500:
+                logger.warning(
+                    "Batch %d/%d returned %d, falling back to individual creates",
+                    batch_idx + 1, len(batches), e.status_code,
+                )
+                _create_relationships_individually(client, batch, checkpoint, checkpoint_path)
+            else:
+                logger.error("Relationship batch %d/%d failed: %s", batch_idx + 1, len(batches), e)
+                existing = set(checkpoint.failed_relationships)
+                for key in keys:
+                    if key not in existing:
+                        checkpoint.failed_relationships.append(key)
+                checkpoint.save(checkpoint_path)
 
 
 def run_verify_phase(
