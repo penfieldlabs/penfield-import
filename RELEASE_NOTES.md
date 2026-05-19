@@ -1,6 +1,10 @@
-# Penfield Import v1.0.0
+# Penfield Import v1.0.1
 
 Import your Obsidian vault, markdown collection, or any folder of `.md` and `.txt` files into [Penfield](https://penfield.app) as searchable memories with a full knowledge graph.
+
+## What's new in v1.0.1
+
+- **Bulk relationship error recovery** — A failed bulk batch (409 conflict or 5xx server error) no longer blocks forward progress. The tool falls back to individual creates, skips duplicates (409), and checkpoints after each item. A circuit breaker aborts the batch after 3 consecutive server errors. Fixed #2.
 
 ## What it does
 
