@@ -1890,5 +1890,232 @@ class TestRelationshipsPhaseErrorHandling:
         mock_client.create_relationships_bulk.assert_called_once()
 
 
+class TestValidatePath:
+    """Tests for _validate_path safety checks."""
+
+    def test_normal_path_passes(self):
+        assert vtp._validate_path("docs/readme.md") is True
+
+    def test_null_byte_rejected(self):
+        assert vtp._validate_path("docs/evil\x00.md") is False
+
+    def test_colon_rejected(self):
+        assert vtp._validate_path("notes:2024.md") is False
+        assert vtp._validate_path("sub/file:stream.txt") is False
+
+    def test_windows_reserved_con_rejected(self):
+        assert vtp._validate_path("docs/CON.txt") is False
+
+    def test_windows_reserved_prn_rejected(self):
+        assert vtp._validate_path("PRN") is False
+
+    def test_windows_reserved_lpt1_rejected(self):
+        assert vtp._validate_path("subdir/LPT1.log") is False
+
+    def test_windows_reserved_case_insensitive(self):
+        assert vtp._validate_path("aux.txt") is False
+        assert vtp._validate_path("Nul.dat") is False
+
+    def test_windows_reserved_with_extension_rejected(self):
+        assert vtp._validate_path("COM1.txt") is False
+
+    def test_dotdot_traversal_rejected(self):
+        assert vtp._validate_path("../etc/passwd") is False
+        assert vtp._validate_path("subdir/../../etc/passwd") is False
+        assert vtp._validate_path("..\\..\\etc\\passwd") is False
+        assert vtp._validate_path("subdir\\..\\..\\secret") is False
+
+    def test_windows_reserved_trailing_dot_rejected(self):
+        assert vtp._validate_path("CON.") is False
+        assert vtp._validate_path("NUL.") is False
+        assert vtp._validate_path("subdir/PRN.") is False
+
+    def test_windows_reserved_multiple_extensions_rejected(self):
+        assert vtp._validate_path("NUL.tar.gz") is False
+        assert vtp._validate_path("CON.txt.md") is False
+        assert vtp._validate_path("AUX.backup.2024") is False
+
+    def test_non_reserved_similar_name_passes(self):
+        assert vtp._validate_path("CONES.txt") is True
+        assert vtp._validate_path("PRINTER.doc") is True
+        assert vtp._validate_path("CONES.") is True
+
+    def test_path_over_1024_bytes_rejected(self):
+        assert vtp._validate_path("a" * 1025) is False
+
+    def test_path_at_1024_bytes_passes(self):
+        assert vtp._validate_path("a" * 1024) is True
+
+    def test_multibyte_utf8_counted_correctly(self):
+        path = "\U0001f600" * 257  # 1028 bytes
+        assert vtp._validate_path(path) is False
+
+
+class TestPathSafetyArtifacts:
+    """Tests that unsafe artifact paths are skipped during import."""
+
+    def test_null_byte_artifact_skipped(self, tmp_path):
+        """Artifact with null byte in path is skipped."""
+        art_dir = tmp_path / "Artifacts"
+        art_dir.mkdir()
+        # We can't create a file with null bytes on most filesystems,
+        # but we can test the validation directly via a mocked file list.
+        # Instead, test with a Windows reserved name which IS a valid filename on Linux.
+        (art_dir / "CON.txt").write_text("payload")
+
+        cp = vtp.Checkpoint()
+        cp_path = tmp_path / ".penfield_import_checkpoint.json"
+        mock_client = mock.MagicMock()
+
+        vtp.run_vault_artifacts_phase(tmp_path, mock_client, cp, cp_path)
+
+        mock_client.create_artifact.assert_not_called()
+        assert cp.vault_artifacts.get("CON.txt") == vtp.SKIP_UNSAFE_PATH
+
+    def test_dotdot_path_artifact_skipped(self, tmp_path):
+        """Artifact in a directory named '..' is skipped."""
+        art_dir = tmp_path / "Artifacts"
+        # Create a subdirectory that would produce a '..' segment
+        # when relativized — on real filesystems this is hard, so we
+        # test with a Windows reserved name instead (also caught).
+        sub = art_dir / "NUL.txt"
+        art_dir.mkdir()
+        sub.write_text("payload")
+
+        cp = vtp.Checkpoint()
+        cp_path = tmp_path / ".penfield_import_checkpoint.json"
+        mock_client = mock.MagicMock()
+
+        vtp.run_vault_artifacts_phase(tmp_path, mock_client, cp, cp_path)
+
+        mock_client.create_artifact.assert_not_called()
+        assert cp.vault_artifacts.get("NUL.txt") == vtp.SKIP_UNSAFE_PATH
+
+    def test_safe_artifact_still_uploaded(self, tmp_path):
+        """Normal artifacts are still uploaded correctly."""
+        art_dir = tmp_path / "Artifacts"
+        art_dir.mkdir()
+        (art_dir / "readme.md").write_text("# Hello")
+
+        cp = vtp.Checkpoint()
+        cp_path = tmp_path / ".penfield_import_checkpoint.json"
+        mock_client = mock.MagicMock()
+
+        vtp.run_vault_artifacts_phase(tmp_path, mock_client, cp, cp_path)
+
+        mock_client.create_artifact.assert_called_once_with("/readme.md", "# Hello")
+        assert cp.vault_artifacts["readme.md"] == "/readme.md"
+
+
+class TestPathSafetyOversizedArtifacts:
+    """Tests that oversized-note artifacts with unsafe paths are skipped."""
+
+    def test_oversized_note_with_reserved_name_skipped(self, tmp_path):
+        """An oversized note whose filename is a Windows reserved name gets skipped."""
+        # Create a note large enough to trigger artifact creation
+        big_content = "x" * (vtp.MEMORY_CONTENT_LIMIT + 100)
+        note = vtp.ParsedNote(
+            rel_path="CON.md",
+            filename="CON",
+            vault_dir="",
+            content=big_content,
+            body=big_content,
+            frontmatter={},
+            relationships=[],
+            tags=[],
+        )
+
+        cp = vtp.Checkpoint(phase="artifacts")
+        cp_path = tmp_path / "cp.json"
+        mock_client = mock.MagicMock()
+
+        vtp.run_artifacts_phase([note], mock_client, cp, cp_path)
+
+        mock_client.create_artifact.assert_not_called()
+        assert cp.artifacts.get("CON.md") == vtp.SKIP_UNSAFE_PATH
+
+    def test_oversized_note_with_safe_name_uploaded(self, tmp_path):
+        """An oversized note with a safe filename is uploaded normally."""
+        big_content = "x" * (vtp.MEMORY_CONTENT_LIMIT + 100)
+        note = vtp.ParsedNote(
+            rel_path="big-note.md",
+            filename="big-note",
+            vault_dir="",
+            content=big_content,
+            body=big_content,
+            frontmatter={},
+            relationships=[],
+            tags=[],
+        )
+
+        cp = vtp.Checkpoint(phase="artifacts")
+        cp_path = tmp_path / "cp.json"
+        mock_client = mock.MagicMock()
+
+        vtp.run_artifacts_phase([note], mock_client, cp, cp_path)
+
+        mock_client.create_artifact.assert_called_once()
+        assert "big-note.md" in cp.artifacts
+
+    def test_long_filename_artifact_skipped(self, tmp_path):
+        """An oversized note whose filename exceeds 1024 bytes gets skipped."""
+        long_name = "a" * 1020 + ".md"  # After sanitization: oversize-notes/aaa...a.md > 1024 bytes
+        big_content = "x" * (vtp.MEMORY_CONTENT_LIMIT + 100)
+        note = vtp.ParsedNote(
+            rel_path=long_name,
+            filename=long_name[:-3],
+            vault_dir="",
+            content=big_content,
+            body=big_content,
+            frontmatter={},
+            relationships=[],
+            tags=[],
+        )
+
+        cp = vtp.Checkpoint(phase="artifacts")
+        cp_path = tmp_path / "cp.json"
+        mock_client = mock.MagicMock()
+
+        vtp.run_artifacts_phase([note], mock_client, cp, cp_path)
+
+        mock_client.create_artifact.assert_not_called()
+        assert cp.artifacts.get(long_name) == vtp.SKIP_UNSAFE_PATH
+
+
+class TestPathSafetyDocuments:
+    """Tests that unsafe document paths are skipped during import."""
+
+    def test_windows_reserved_document_skipped(self, tmp_path):
+        """Document with Windows reserved name is skipped."""
+        docs_dir = tmp_path / "Documents"
+        docs_dir.mkdir()
+        (docs_dir / "PRN.txt").write_text("payload")
+
+        cp = vtp.Checkpoint()
+        cp_path = tmp_path / ".penfield_import_checkpoint.json"
+        mock_client = mock.MagicMock()
+
+        vtp.run_documents_phase(tmp_path, mock_client, cp, cp_path)
+
+        mock_client.upload_document.assert_not_called()
+        assert cp.documents.get("PRN.txt") == vtp.SKIP_UNSAFE_PATH
+
+    def test_safe_document_still_uploaded(self, tmp_path):
+        """Normal documents are still uploaded correctly."""
+        docs_dir = tmp_path / "Documents"
+        docs_dir.mkdir()
+        (docs_dir / "report.pdf").write_bytes(b"%PDF-1.4 fake")
+
+        cp = vtp.Checkpoint()
+        cp_path = tmp_path / ".penfield_import_checkpoint.json"
+        mock_client = mock.MagicMock()
+        mock_client.upload_document.return_value = {"id": "doc-uuid"}
+
+        vtp.run_documents_phase(tmp_path, mock_client, cp, cp_path)
+
+        mock_client.upload_document.assert_called_once()
+        assert "report.pdf" in cp.documents
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

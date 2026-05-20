@@ -83,6 +83,40 @@ CHECKPOINT_FILENAME = ".penfield_import_checkpoint.json"
 SKIP_SENTINEL_PREFIX = "__"
 SKIP_EMPTY = "__skipped_empty__"
 SKIP_BINARY = "__skipped_binary__"
+SKIP_UNSAFE_PATH = "__skipped_unsafe_path__"
+
+_WINDOWS_RESERVED = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+})
+
+
+def _validate_path(name: str) -> bool:
+    """Return True if *name* passes path-safety checks for import.
+
+    Rejects null bytes, colons (illegal on Windows/macOS, NTFS ADS vector),
+    ``..`` segments (forward or backslash separated), Windows-reserved device
+    names (per segment), and paths exceeding 1024 bytes when UTF-8-encoded.
+    """
+    if "\x00" in name or ":" in name:
+        return False
+    if len(name.encode("utf-8")) > 1024:
+        return False
+    normalized = name.replace("\\", "/")
+    segments = [s for s in normalized.split("/") if s]
+    for segment in segments:
+        if segment == "..":
+            return False
+        # Windows reserves names like CON, NUL regardless of extension
+        # count (NUL.tar.gz is still the NUL device).  Use the part
+        # before the first dot.  Also strip trailing dots/spaces since
+        # Windows silently removes them ("CON." -> CON device).
+        base = segment.split(".")[0].rstrip(" ").upper()
+        if base in _WINDOWS_RESERVED:
+            return False
+    return True
+
 
 # Wikilink in frontmatter arrays: [[Target]] or [[Target|alias]]
 FRONTMATTER_WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
@@ -1154,6 +1188,11 @@ def run_artifacts_phase(
             continue
 
         art_path = artifact_path_for_note(note)
+        if not _validate_path(art_path.lstrip("/")):
+            logger.warning("[%d/%d] Skipping unsafe artifact path: %s", i + 1, len(oversized), art_path)
+            checkpoint.artifacts[note.rel_path] = SKIP_UNSAFE_PATH
+            checkpoint.save(checkpoint_path)
+            continue
         logger.info("[%d/%d] Uploading artifact: %s", i + 1, len(oversized), art_path)
 
         try:
@@ -1215,6 +1254,12 @@ def run_vault_artifacts_phase(
         rel_key = str(rel)
 
         if rel_key in checkpoint.vault_artifacts:
+            continue
+
+        if not _validate_path(str(rel)):
+            logger.warning("[%d/%d] Skipping unsafe artifact path: %s", i + 1, len(files), art_path)
+            checkpoint.vault_artifacts[rel_key] = SKIP_UNSAFE_PATH
+            checkpoint.save(checkpoint_path)
             continue
 
         # Read file content — try as text, skip true binary files
@@ -1281,6 +1326,12 @@ def run_documents_phase(
     for i, filepath in enumerate(files):
         doc_key = str(filepath.relative_to(documents_dir))
         if doc_key in checkpoint.documents:
+            continue
+
+        if not _validate_path(doc_key):
+            logger.warning("[%d/%d] Skipping unsafe document path: %s", i + 1, len(files), doc_key)
+            checkpoint.documents[doc_key] = SKIP_UNSAFE_PATH
+            checkpoint.save(checkpoint_path)
             continue
 
         file_size = filepath.stat().st_size
@@ -1515,9 +1566,10 @@ def run_verify_phase(
     checkpoint.phase = "verify"
 
     expected_memories = sum(1 for v in checkpoint.memories.values() if not v.startswith(SKIP_SENTINEL_PREFIX))
+    oversized_art_count = sum(1 for v in checkpoint.artifacts.values() if not v.startswith(SKIP_SENTINEL_PREFIX))
     vault_art_count = sum(1 for v in checkpoint.vault_artifacts.values() if not v.startswith(SKIP_SENTINEL_PREFIX))
-    expected_artifacts = len(checkpoint.artifacts) + vault_art_count
-    expected_documents = len(checkpoint.documents)
+    expected_artifacts = oversized_art_count + vault_art_count
+    expected_documents = sum(1 for v in checkpoint.documents.values() if not v.startswith(SKIP_SENTINEL_PREFIX))
     expected_rels = len(checkpoint.relationships_done)
 
     print("\n=== Import Verification ===\n")
@@ -1827,12 +1879,14 @@ def write_import_report(
     mem_failed = len(checkpoint.failed_memories)
     mem_rate = (mem_created / total_notes * 100) if total_notes > 0 else 0
 
-    art_uploaded = len(checkpoint.artifacts)
+    art_uploaded = sum(1 for v in checkpoint.artifacts.values() if not v.startswith(SKIP_SENTINEL_PREFIX))
+    art_skipped = sum(1 for v in checkpoint.artifacts.values() if v.startswith(SKIP_SENTINEL_PREFIX))
     art_failed = len(checkpoint.failed_artifacts)
     vault_art_uploaded = sum(1 for v in checkpoint.vault_artifacts.values() if not v.startswith(SKIP_SENTINEL_PREFIX))
     vault_art_skipped = sum(1 for v in checkpoint.vault_artifacts.values() if v.startswith(SKIP_SENTINEL_PREFIX))
     vault_art_failed = len(checkpoint.failed_vault_artifacts)
-    doc_uploaded = len(checkpoint.documents)
+    doc_uploaded = sum(1 for v in checkpoint.documents.values() if not v.startswith(SKIP_SENTINEL_PREFIX))
+    doc_skipped = sum(1 for v in checkpoint.documents.values() if v.startswith(SKIP_SENTINEL_PREFIX))
     doc_failed = len(checkpoint.failed_documents)
 
     rel_created = len(checkpoint.relationships_done)
@@ -1856,11 +1910,12 @@ def write_import_report(
         "",
         "ARTIFACTS:",
         f"  Uploaded:     {art_uploaded + vault_art_uploaded}",
-        f"  Skipped:      {vault_art_skipped} (binary)",
+        f"  Skipped:      {art_skipped + vault_art_skipped} (binary/unsafe)",
         f"  Failed:       {art_failed + vault_art_failed}",
         "",
         "DOCUMENTS:",
         f"  Uploaded:     {doc_uploaded}",
+        f"  Skipped:      {doc_skipped} (unsafe)",
         f"  Failed:       {doc_failed}",
         "",
         "RELATIONSHIPS:",
