@@ -83,6 +83,36 @@ CHECKPOINT_FILENAME = ".penfield_import_checkpoint.json"
 SKIP_SENTINEL_PREFIX = "__"
 SKIP_EMPTY = "__skipped_empty__"
 SKIP_BINARY = "__skipped_binary__"
+SKIP_UNSAFE_PATH = "__skipped_unsafe_path__"
+
+_WINDOWS_RESERVED = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+})
+
+
+def _validate_path(name: str) -> bool:
+    """Return True if *name* passes path-safety checks for import.
+
+    Rejects null bytes, ``..`` segments (forward or backslash separated),
+    Windows-reserved device names (per segment), and paths exceeding
+    1024 bytes when UTF-8-encoded.
+    """
+    if "\x00" in name:
+        return False
+    if len(name.encode("utf-8")) > 1024:
+        return False
+    normalized = name.replace("\\", "/")
+    segments = [s for s in normalized.split("/") if s]
+    for segment in segments:
+        if segment == "..":
+            return False
+        stem = Path(segment).stem.upper()
+        if stem in _WINDOWS_RESERVED:
+            return False
+    return True
+
 
 # Wikilink in frontmatter arrays: [[Target]] or [[Target|alias]]
 FRONTMATTER_WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
@@ -1217,6 +1247,12 @@ def run_vault_artifacts_phase(
         if rel_key in checkpoint.vault_artifacts:
             continue
 
+        if not _validate_path(str(rel)):
+            logger.warning("[%d/%d] Skipping unsafe artifact path: %s", i + 1, len(files), art_path)
+            checkpoint.vault_artifacts[rel_key] = SKIP_UNSAFE_PATH
+            checkpoint.save(checkpoint_path)
+            continue
+
         # Read file content — try as text, skip true binary files
         try:
             content = filepath.read_text(encoding="utf-8")
@@ -1281,6 +1317,13 @@ def run_documents_phase(
     for i, filepath in enumerate(files):
         doc_key = str(filepath.relative_to(documents_dir))
         if doc_key in checkpoint.documents:
+            continue
+
+        if not _validate_path(doc_key):
+            logger.warning("[%d/%d] Skipping unsafe document path: %s", i + 1, len(files), doc_key)
+            if doc_key not in checkpoint.failed_documents:
+                checkpoint.failed_documents.append(doc_key)
+            checkpoint.save(checkpoint_path)
             continue
 
         file_size = filepath.stat().st_size
