@@ -33,7 +33,7 @@ try:
     from importlib.metadata import version as _pkg_version
     __version__ = _pkg_version("penfield_import")
 except Exception:
-    __version__ = "1.0.1"  # fallback when running uninstalled
+    __version__ = "1.0.2"  # fallback when running uninstalled
 
 # ---------------------------------------------------------------------------
 # Optional OAuth module (penfield_auth.py)

@@ -1,10 +1,10 @@
-# Penfield Import v1.0.1
+# Penfield Import v1.0.2
 
 Import your Obsidian vault, markdown collection, or any folder of `.md` and `.txt` files into [Penfield](https://penfield.app) as searchable memories with a full knowledge graph.
 
-## What's new in v1.0.1
+## What's new in v1.0.2
 
-- **Bulk relationship error recovery** — A failed bulk batch (409 conflict or 5xx server error) no longer blocks forward progress. The tool falls back to individual creates, skips duplicates (409), and checkpoints after each item. A circuit breaker aborts the batch after 3 consecutive server errors. Fixed #2.
+- **Path safety validation** — All file upload paths (oversized-note artifacts, vault artifacts, documents) are now validated before sending to the API. Paths containing null bytes, colons, directory traversal sequences, Windows reserved device names (CON, PRN, NUL, AUX, COM1–9, LPT1–9 — regardless of extension), or exceeding 1024 UTF-8 bytes are blocked. Skipped files are checkpointed so they are never re-attempted on resume.
 
 ## What it does
 
