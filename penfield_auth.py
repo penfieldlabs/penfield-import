@@ -22,7 +22,7 @@ from typing import Any, Optional
 try:
     from penfield_import import __version__
 except ImportError:
-    __version__ = "1.0.1"
+    __version__ = "2.0.0"
 
 BASE_URL = "https://api.penfield.app"
 USER_AGENT = f"penfield-import/{__version__}"

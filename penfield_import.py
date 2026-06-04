@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Import a directory of markdown and text files into Penfield as memories, relationships, and artifacts.
+"""Import into Penfield from a portal export ZIP or a directory of markdown/text files.
 
-Designed for vaults using obsidian-wikilink-types
-(https://github.com/penfieldlabs/obsidian-wikilink-types) — the plugin syncs
-typed wikilinks to YAML frontmatter, which this tool reads for import.
+Supports two input types:
+- Penfield portal exports (EXPORT_FORMAT_SPEC_v1 ZIP archives)
+- Obsidian vaults / markdown directories (with optional obsidian-wikilink-types relationships)
 
 Usage:
-    python penfield_import.py /path/to/vault [options]
+    penfield-import /path/to/export.zip [options]
+    penfield-import /path/to/vault [options]
 
 Authenticate via --login (OAuth) or set PENFIELD_API_KEY environment variable.
 """
@@ -33,7 +34,7 @@ try:
     from importlib.metadata import version as _pkg_version
     __version__ = _pkg_version("penfield_import")
 except Exception:
-    __version__ = "1.0.2"  # fallback when running uninstalled
+    __version__ = "2.0.0"  # fallback when running uninstalled
 
 # ---------------------------------------------------------------------------
 # Optional OAuth module (penfield_auth.py)
@@ -57,6 +58,7 @@ CLAUDE_DEFAULT_MODEL = "haiku"
 
 MEMORY_CONTENT_LIMIT = 10_000
 TRUNCATE_TARGET = 9_500
+ARTIFACT_SIZE_LIMIT = 1 * 1024 * 1024  # 1MB, matches API enforcement
 
 RATE_LIMIT_RPM = 200
 RATE_WINDOW_SECONDS = 60
@@ -84,6 +86,7 @@ SKIP_SENTINEL_PREFIX = "__"
 SKIP_EMPTY = "__skipped_empty__"
 SKIP_BINARY = "__skipped_binary__"
 SKIP_UNSAFE_PATH = "__skipped_unsafe_path__"
+SKIP_OVERSIZED = "__skipped_oversized__"
 
 _WINDOWS_RESERVED = frozenset({
     "CON", "PRN", "AUX", "NUL",
@@ -586,6 +589,10 @@ class PenfieldClient:
         content: str,
         tags: Optional[list[str]] = None,
         memory_type: Optional[str] = None,
+        importance: Optional[float] = None,
+        confidence: Optional[float] = None,
+        source_type: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> str:
         """Create a memory and return its UUID."""
         payload: dict[str, Any] = {"content": content}
@@ -593,6 +600,14 @@ class PenfieldClient:
             payload["tags"] = tags[:10]
         if memory_type:
             payload["memory_type"] = memory_type
+        if importance is not None:
+            payload["importance"] = importance
+        if confidence is not None:
+            payload["confidence"] = confidence
+        if source_type:
+            payload["source_type"] = source_type
+        if metadata:
+            payload["metadata"] = metadata
         resp = self.request("POST", "/memories", payload)
         return resp["data"]["id"]
 
@@ -600,31 +615,44 @@ class PenfieldClient:
         """Upload an artifact. Returns response data."""
         return self.request("POST", "/artifacts", {"path": path, "content": content})
 
-    def upload_document(self, filepath: Path) -> dict[str, Any]:
-        """Upload a document file via multipart form with retry.
-
-        Uses the same retry/refresh logic as ``request()`` for resilience.
-        """
+    def upload_document_bytes(
+        self,
+        filename: str,
+        data: bytes,
+        content_type: str = "application/octet-stream",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Upload a document from in-memory bytes via multipart form with retry."""
         import uuid
 
         self._ensure_token()
         self._rate_limiter.wait()
 
-        file_data = filepath.read_bytes()
-        # Sanitize filename: strip CRLF, null, and escape quotes
-        safe_filename = filepath.name.replace("\r", "").replace("\n", "").replace("\x00", "").replace('"', "")
+        safe_filename = filename.replace("\r", "").replace("\n", "").replace("\x00", "").replace('"', "")
 
         url = f"{self._base_url}/documents/upload"
         auth_refreshes = 0
         for attempt in range(4):
             boundary = f"----PenfieldImport{uuid.uuid4().hex}"
-            body = (
+            parts = (
                 f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="file"; filename="{safe_filename}"\r\n'
-                f"Content-Type: application/octet-stream\r\n\r\n"
-            ).encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8") + data
+
+            if metadata:
+                meta_json = json.dumps(metadata)
+                parts += (
+                    f"\r\n--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="metadata"\r\n'
+                    f"Content-Type: application/json\r\n\r\n"
+                    f"{meta_json}"
+                ).encode("utf-8")
+
+            parts += f"\r\n--{boundary}--\r\n".encode("utf-8")
+
             req = urllib.request.Request(
-                url, data=body,
+                url, data=parts,
                 headers={
                     "Authorization": f"Bearer {self._access_token}",
                     "Content-Type": f"multipart/form-data; boundary={boundary}",
@@ -635,8 +663,7 @@ class PenfieldClient:
             try:
                 with urllib.request.urlopen(req, timeout=120) as resp:
                     result = json.loads(resp.read().decode())
-                    data = result.get("data", result)
-                    return data
+                    return result.get("data", result)
             except urllib.error.HTTPError as e:
                 error_body = ""
                 try:
@@ -661,6 +688,10 @@ class PenfieldClient:
                 raise APIError(e.code, error_body, url) from e
 
         raise APIError(0, "Document upload: max retries exceeded", url)
+
+    def upload_document(self, filepath: Path) -> dict[str, Any]:
+        """Upload a document file. Delegates to upload_document_bytes."""
+        return self.upload_document_bytes(filepath.name, filepath.read_bytes())
 
     def create_relationships_bulk(self, relationships: list[dict[str, Any]]) -> dict[str, Any]:
         """Bulk create relationships."""
@@ -1003,7 +1034,7 @@ def parse_vault(
             continue
         # personality_trait can't go via /memories — import as fact with a note
         if memory_type == "personality_trait":
-            body = f"[Imported personality_trait note]\n\n{body}"
+            body = f"[Imported personality_trait]\n\n{body}"
             memory_type = "fact"
         # The `checkpoint` memory type is the persistence layer for MCP
         # cognitive handoffs created by the `save_context` tool; each record
@@ -1262,12 +1293,29 @@ def run_vault_artifacts_phase(
             checkpoint.save(checkpoint_path)
             continue
 
-        # Read file content — try as text, skip true binary files
+        # Detect binary files via null bytes in the first 8KB
+        raw_head = filepath.read_bytes()[:8192]
+        if b"\x00" in raw_head:
+            logger.warning("[%d/%d] Skipping binary artifact: %s", i + 1, len(files), art_path)
+            checkpoint.vault_artifacts[rel_key] = SKIP_BINARY
+            checkpoint.save(checkpoint_path)
+            continue
+
         try:
             content = filepath.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            logger.warning("[%d/%d] Skipping binary artifact: %s", i + 1, len(files), art_path)
+            logger.warning("[%d/%d] Skipping binary artifact (decode failed): %s", i + 1, len(files), art_path)
             checkpoint.vault_artifacts[rel_key] = SKIP_BINARY
+            checkpoint.save(checkpoint_path)
+            continue
+
+        content_size = len(content.encode("utf-8"))
+        if content_size > ARTIFACT_SIZE_LIMIT:
+            logger.warning(
+                "[%d/%d] Skipping oversized artifact (%d bytes, limit %d): %s",
+                i + 1, len(files), content_size, ARTIFACT_SIZE_LIMIT, art_path,
+            )
+            checkpoint.vault_artifacts[rel_key] = SKIP_OVERSIZED
             checkpoint.save(checkpoint_path)
             continue
 
@@ -1389,17 +1437,19 @@ def build_relationship_list(
 
     filename_collisions: dict[str, list[str]] = {}
     for note in notes:
-        if note.filename in filename_to_relpath:
+        existing = filename_to_relpath.get(note.filename)
+        if existing is not None and existing != note.rel_path:
             if note.filename not in filename_collisions:
-                filename_collisions[note.filename] = [filename_to_relpath[note.filename]]
+                filename_collisions[note.filename] = [existing]
             filename_collisions[note.filename].append(note.rel_path)
         filename_to_relpath[note.filename] = note.rel_path
     for name, paths in filename_collisions.items():
         logger.warning(
             "Duplicate filename '%s' in %d locations — relationships targeting "
-            "this name will resolve to '%s': %s",
-            name, len(paths), paths[-1], ", ".join(paths),
+            "this name will be skipped (ambiguous): %s",
+            name, len(paths), ", ".join(paths),
         )
+        del filename_to_relpath[name]
 
     # Filter out skipped/sentinel entries — only real memory UUIDs
     memory_lookup = {
@@ -1729,6 +1779,714 @@ def dry_run_report(notes: list[ParsedNote], args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ZIP / JSONL import (Penfield portal export format)
+# ---------------------------------------------------------------------------
+
+import zipfile
+
+MAX_DOCUMENT_SIZE = 20 * 1024 * 1024  # 20MB, matches API enforcement
+
+ZIP_PHASE_ORDER = ["manifest", "memories", "relationships", "contexts", "artifacts", "documents", "verify", "done"]
+
+
+@dataclass
+class ZipCheckpoint:
+    """Checkpoint for ZIP import crash recovery and resume."""
+    phase: str = "manifest"
+    memory_id_map: dict[str, str] = field(default_factory=dict)
+    skipped_memories: dict[str, str] = field(default_factory=dict)
+    relationships_done: set[str] = field(default_factory=set)
+    contexts: dict[str, str] = field(default_factory=dict)
+    artifacts: dict[str, str] = field(default_factory=dict)
+    documents: dict[str, str] = field(default_factory=dict)
+    failed_memories: list[str] = field(default_factory=list)
+    failed_relationships: list[str] = field(default_factory=list)
+    failed_contexts: list[str] = field(default_factory=list)
+    failed_artifacts: list[str] = field(default_factory=list)
+    failed_documents: list[str] = field(default_factory=list)
+    source_tenant_id: str = ""
+    schema_version: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d = {
+            "phase": self.phase,
+            "memory_id_map": self.memory_id_map,
+            "skipped_memories": self.skipped_memories,
+            "relationships_done": sorted(self.relationships_done),
+            "contexts": self.contexts,
+            "artifacts": self.artifacts,
+            "documents": self.documents,
+            "failed_memories": self.failed_memories,
+            "failed_relationships": self.failed_relationships,
+            "failed_contexts": self.failed_contexts,
+            "failed_artifacts": self.failed_artifacts,
+            "failed_documents": self.failed_documents,
+            "source_tenant_id": self.source_tenant_id,
+            "schema_version": self.schema_version,
+        }
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ZipCheckpoint":
+        return cls(
+            phase=data.get("phase", "manifest"),
+            memory_id_map=data.get("memory_id_map", {}),
+            skipped_memories=data.get("skipped_memories", {}),
+            relationships_done=set(data.get("relationships_done", [])),
+            contexts=data.get("contexts", {}),
+            artifacts=data.get("artifacts", {}),
+            documents=data.get("documents", {}),
+            failed_memories=data.get("failed_memories", []),
+            failed_relationships=data.get("failed_relationships", []),
+            failed_contexts=data.get("failed_contexts", []),
+            failed_artifacts=data.get("failed_artifacts", []),
+            failed_documents=data.get("failed_documents", []),
+            source_tenant_id=data.get("source_tenant_id", ""),
+            schema_version=data.get("schema_version", ""),
+        )
+
+    def save(self, path: Path) -> None:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    @classmethod
+    def load(cls, path: Path) -> "ZipCheckpoint":
+        if not path.exists():
+            return cls()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return cls.from_dict(data)
+        except (json.JSONDecodeError, KeyError):
+            logger.warning("Corrupt ZIP checkpoint file, starting fresh")
+            return cls()
+
+
+ZIP_CHECKPOINT_FILENAME = ".penfield_zip_import_checkpoint.json"
+
+
+def _zip_phase_index(phase: str) -> int:
+    try:
+        return ZIP_PHASE_ORDER.index(phase)
+    except ValueError:
+        return 0
+
+
+def validate_zip_manifest(zf: zipfile.ZipFile) -> dict[str, Any]:
+    """Read and validate manifest.json from the ZIP. Returns parsed manifest."""
+    try:
+        with zf.open("manifest.json") as f:
+            manifest = json.loads(f.read().decode("utf-8"))
+    except KeyError:
+        raise ValueError("ZIP archive missing manifest.json")
+    except json.JSONDecodeError:
+        raise ValueError("manifest.json is not valid JSON")
+
+    version = manifest.get("schema_version", "")
+    if not version.startswith("1."):
+        raise ValueError(f"Unsupported schema version: {version!r} (expected 1.x)")
+
+    required_files = ["memories.jsonl", "relationships.jsonl", "contexts.jsonl",
+                      "artifacts.jsonl", "documents.jsonl"]
+    zip_names = set(zf.namelist())
+    for fname in required_files:
+        if fname not in zip_names:
+            raise ValueError(f"ZIP archive missing required file: {fname}")
+
+    counts = manifest.get("counts", {})
+    for fname in required_files:
+        expected = counts.get(fname.replace(".jsonl", ""), 0)
+        with zf.open(fname) as f:
+            actual = sum(1 for line in f if line.strip())
+        if actual != expected:
+            raise ValueError(
+                f"Count mismatch in {fname}: manifest says {expected}, file has {actual} records"
+            )
+
+    return manifest
+
+
+def run_zip_memories_phase(
+    zf: zipfile.ZipFile,
+    client: PenfieldClient,
+    checkpoint: ZipCheckpoint,
+    checkpoint_path: Path,
+) -> None:
+    """Import memories from memories.jsonl, building the ID remap table."""
+    checkpoint.phase = "memories"
+
+    with zf.open("memories.jsonl") as f:
+        records = [json.loads(line) for line in f if line.strip()]
+
+    total = len(records)
+    for i, rec in enumerate(records):
+        source_id = rec["id"]
+        if source_id in checkpoint.memory_id_map or source_id in checkpoint.skipped_memories:
+            continue
+
+        memory_type = rec.get("memory_type")
+
+        if memory_type == "identity_core":
+            logger.info("[%d/%d] Skipping identity_core memory: %s", i + 1, total, source_id)
+            checkpoint.skipped_memories[source_id] = "identity_core"
+            checkpoint.save(checkpoint_path)
+            continue
+
+        if memory_type == "personality_trait":
+            logger.info("[%d/%d] Downgrading personality_trait to fact: %s", i + 1, total, source_id)
+            rec["content"] = f"[Imported personality_trait]\n\n{rec['content']}"
+            memory_type = "fact"
+
+        logger.info("[%d/%d] Creating memory: %s", i + 1, total, source_id)
+
+        try:
+            new_id = client.create_memory(
+                content=rec["content"],
+                tags=rec.get("tags"),
+                memory_type=memory_type,
+                importance=rec.get("importance"),
+                confidence=rec.get("confidence"),
+                source_type=rec.get("source_type"),
+                metadata=rec.get("metadata"),
+            )
+            checkpoint.memory_id_map[source_id] = new_id
+            if source_id in checkpoint.failed_memories:
+                checkpoint.failed_memories.remove(source_id)
+        except APIError as e:
+            logger.error("Failed to create memory %s: %s", source_id, e)
+            if source_id not in checkpoint.failed_memories:
+                checkpoint.failed_memories.append(source_id)
+
+        checkpoint.save(checkpoint_path)
+
+
+def run_zip_relationships_phase(
+    zf: zipfile.ZipFile,
+    client: PenfieldClient,
+    checkpoint: ZipCheckpoint,
+    checkpoint_path: Path,
+) -> None:
+    """Import relationships with ID remapping."""
+    checkpoint.phase = "relationships"
+
+    with zf.open("relationships.jsonl") as f:
+        records = [json.loads(line) for line in f if line.strip()]
+
+    pending: list[tuple[str, dict[str, Any]]] = []
+    for rec in records:
+        source_id = rec["id"]
+        if source_id in checkpoint.relationships_done:
+            continue
+
+        new_from = checkpoint.memory_id_map.get(rec["from_id"])
+        new_to = checkpoint.memory_id_map.get(rec["to_id"])
+
+        if not new_from:
+            logger.warning("Skipping relationship %s: from_id %s not mapped (dangling)", source_id, rec["from_id"])
+            checkpoint.relationships_done.add(source_id)
+            continue
+        if not new_to:
+            logger.warning("Skipping relationship %s: to_id %s not mapped (dangling)", source_id, rec["to_id"])
+            checkpoint.relationships_done.add(source_id)
+            continue
+
+        payload: dict[str, Any] = {
+            "from_id": new_from,
+            "to_id": new_to,
+            "relationship_type": rec["relationship_type"],
+        }
+        if "direction_type" in rec:
+            payload["direction_type"] = rec["direction_type"]
+        if "inverse_type" in rec and rec["inverse_type"]:
+            payload["inverse_type"] = rec["inverse_type"]
+        if "strength" in rec:
+            payload["strength"] = rec["strength"]
+        if "confidence" in rec:
+            payload["confidence"] = rec["confidence"]
+        if "metadata" in rec and rec["metadata"]:
+            payload["relationship_metadata"] = rec["metadata"]
+
+        pending.append((source_id, payload))
+
+    if not pending:
+        logger.info("No relationships to create")
+        checkpoint.save(checkpoint_path)
+        return
+
+    batches: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(0, len(pending), BULK_RELATIONSHIP_BATCH_SIZE):
+        batches.append(pending[i:i + BULK_RELATIONSHIP_BATCH_SIZE])
+
+    logger.info("Creating %d relationships in %d batches", len(pending), len(batches))
+
+    for batch_idx, batch in enumerate(batches):
+        keys = [key for key, _ in batch]
+        payloads = [payload for _, payload in batch]
+
+        logger.info("[%d/%d] Sending relationship batch (%d rels)", batch_idx + 1, len(batches), len(payloads))
+
+        try:
+            client.create_relationships_bulk(payloads)
+            checkpoint.relationships_done.update(keys)
+            checkpoint.failed_relationships = [
+                k for k in checkpoint.failed_relationships if k not in keys
+            ]
+            checkpoint.save(checkpoint_path)
+        except APIError as e:
+            if e.status_code == 409 or e.status_code >= 500:
+                logger.warning(
+                    "Batch %d/%d returned %d, falling back to individual creates",
+                    batch_idx + 1, len(batches), e.status_code,
+                )
+                consecutive_500s = 0
+                for key, payload in batch:
+                    if key in checkpoint.relationships_done:
+                        continue
+                    try:
+                        client.create_relationships_bulk([payload])
+                        checkpoint.relationships_done.add(key)
+                        if key in checkpoint.failed_relationships:
+                            checkpoint.failed_relationships.remove(key)
+                        consecutive_500s = 0
+                    except APIError as e2:
+                        if e2.status_code == 409:
+                            logger.info("Relationship %s already exists, skipping", key)
+                            checkpoint.relationships_done.add(key)
+                            consecutive_500s = 0
+                        elif e2.status_code >= 500:
+                            consecutive_500s += 1
+                            logger.error("Failed to create relationship %s: %s", key, e2)
+                            if key not in checkpoint.failed_relationships:
+                                checkpoint.failed_relationships.append(key)
+                            if consecutive_500s >= _CONSECUTIVE_500_LIMIT:
+                                remaining = [k for k, _ in batch if k not in checkpoint.relationships_done]
+                                logger.warning(
+                                    "%d consecutive server errors — aborting batch, %d items deferred",
+                                    _CONSECUTIVE_500_LIMIT, len(remaining),
+                                )
+                                existing = set(checkpoint.failed_relationships)
+                                for k in remaining:
+                                    if k not in existing:
+                                        checkpoint.failed_relationships.append(k)
+                                checkpoint.save(checkpoint_path)
+                                break
+                        else:
+                            logger.error("Failed to create relationship %s: %s", key, e2)
+                            if key not in checkpoint.failed_relationships:
+                                checkpoint.failed_relationships.append(key)
+                            consecutive_500s = 0
+                    checkpoint.save(checkpoint_path)
+            else:
+                logger.error("Relationship batch %d/%d failed: %s", batch_idx + 1, len(batches), e)
+                for key in keys:
+                    if key not in checkpoint.failed_relationships:
+                        checkpoint.failed_relationships.append(key)
+                checkpoint.save(checkpoint_path)
+
+
+def run_zip_contexts_phase(
+    zf: zipfile.ZipFile,
+    client: PenfieldClient,
+    checkpoint: ZipCheckpoint,
+    checkpoint_path: Path,
+) -> None:
+    """Recreate contexts as checkpoint memories with remapped IDs."""
+    checkpoint.phase = "contexts"
+
+    with zf.open("contexts.jsonl") as f:
+        records = [json.loads(line) for line in f if line.strip()]
+
+    if not records:
+        logger.info("No contexts to import")
+        checkpoint.save(checkpoint_path)
+        return
+
+    total = len(records)
+    for i, rec in enumerate(records):
+        source_id = rec["id"]
+        if source_id in checkpoint.contexts:
+            continue
+
+        name = rec.get("name", "")
+        description = rec.get("description", "")
+        source_memory_ids = rec.get("memory_ids") or []
+
+        remapped_ids = [
+            checkpoint.memory_id_map[mid]
+            for mid in source_memory_ids
+            if mid in checkpoint.memory_id_map
+        ]
+        dangling = len(source_memory_ids) - len(remapped_ids)
+
+        if not remapped_ids and source_memory_ids:
+            logger.warning("[%d/%d] Skipping context %r: all %d memory_ids are dangling",
+                           i + 1, total, name, len(source_memory_ids))
+            checkpoint.contexts[source_id] = "__skipped_dangling__"
+            checkpoint.save(checkpoint_path)
+            continue
+
+        if dangling > 0:
+            logger.warning("[%d/%d] Context %r: %d of %d memory_ids are dangling",
+                           i + 1, total, name, dangling, len(source_memory_ids))
+
+        context_content = {
+            "checkpoint_name": name,
+            "description": description,
+            "memory_count": len(remapped_ids),
+            "memory_ids": remapped_ids,
+            "referenced_memories": remapped_ids,
+        }
+
+        logger.info("[%d/%d] Creating context: %s (%d memories)", i + 1, total, name, len(remapped_ids))
+
+        try:
+            new_id = client.create_memory(
+                content=json.dumps(context_content),
+                memory_type="checkpoint",
+                importance=0.9,
+                tags=["context", "checkpoint", name],
+                metadata={"checkpoint_name": name, "memory_count": len(remapped_ids)},
+            )
+            checkpoint.contexts[source_id] = new_id
+            if source_id in checkpoint.failed_contexts:
+                checkpoint.failed_contexts.remove(source_id)
+        except APIError as e:
+            if e.status_code == 409:
+                logger.info("Context %r already exists, skipping", name)
+                checkpoint.contexts[source_id] = "__skipped_conflict__"
+            else:
+                logger.error("Failed to create context %r: %s", name, e)
+                if source_id not in checkpoint.failed_contexts:
+                    checkpoint.failed_contexts.append(source_id)
+
+        checkpoint.save(checkpoint_path)
+
+
+_ARTIFACT_PATH_RE = re.compile(r'^/[a-zA-Z0-9\-_./]+$')
+
+
+def run_zip_artifacts_phase(
+    zf: zipfile.ZipFile,
+    client: PenfieldClient,
+    checkpoint: ZipCheckpoint,
+    checkpoint_path: Path,
+) -> None:
+    """Import artifacts from artifacts.jsonl + artifacts/ directory."""
+    checkpoint.phase = "artifacts"
+
+    with zf.open("artifacts.jsonl") as f:
+        records = [json.loads(line) for line in f if line.strip()]
+
+    if not records:
+        logger.info("No artifacts to import")
+        checkpoint.save(checkpoint_path)
+        return
+
+    total = len(records)
+    for i, rec in enumerate(records):
+        art_path = rec["path"]
+        if art_path in checkpoint.artifacts:
+            continue
+
+        if not _validate_path(art_path.lstrip("/")):
+            logger.warning("[%d/%d] Skipping unsafe artifact path: %s", i + 1, total, art_path)
+            checkpoint.artifacts[art_path] = SKIP_UNSAFE_PATH
+            checkpoint.save(checkpoint_path)
+            continue
+
+        if not _ARTIFACT_PATH_RE.match(art_path):
+            logger.warning("[%d/%d] Skipping artifact with invalid path characters: %s", i + 1, total, art_path)
+            checkpoint.artifacts[art_path] = SKIP_UNSAFE_PATH
+            checkpoint.save(checkpoint_path)
+            continue
+
+        zip_entry = "artifacts" + art_path
+        if zip_entry not in zf.namelist():
+            logger.warning("[%d/%d] Artifact file missing from ZIP: %s", i + 1, total, zip_entry)
+            checkpoint.artifacts[art_path] = "__skipped_missing__"
+            checkpoint.save(checkpoint_path)
+            continue
+
+        raw = zf.read(zip_entry)
+
+        if b"\x00" in raw[:8192]:
+            logger.warning("[%d/%d] Skipping binary artifact: %s", i + 1, total, art_path)
+            checkpoint.artifacts[art_path] = SKIP_BINARY
+            checkpoint.save(checkpoint_path)
+            continue
+
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.warning("[%d/%d] Skipping binary artifact (decode failed): %s", i + 1, total, art_path)
+            checkpoint.artifacts[art_path] = SKIP_BINARY
+            checkpoint.save(checkpoint_path)
+            continue
+
+        if len(raw) > ARTIFACT_SIZE_LIMIT:
+            logger.warning("[%d/%d] Skipping oversized artifact (%d bytes, limit %d): %s",
+                           i + 1, total, len(raw), ARTIFACT_SIZE_LIMIT, art_path)
+            checkpoint.artifacts[art_path] = SKIP_OVERSIZED
+            checkpoint.save(checkpoint_path)
+            continue
+
+        logger.info("[%d/%d] Uploading artifact: %s", i + 1, total, art_path)
+
+        try:
+            client.create_artifact(art_path, content)
+            checkpoint.artifacts[art_path] = art_path
+            if art_path in checkpoint.failed_artifacts:
+                checkpoint.failed_artifacts.remove(art_path)
+        except APIError as e:
+            if e.status_code == 409:
+                logger.info("Artifact already exists at %s, skipping", art_path)
+                checkpoint.artifacts[art_path] = art_path
+            else:
+                logger.error("Failed to upload artifact %s: %s", art_path, e)
+                if art_path not in checkpoint.failed_artifacts:
+                    checkpoint.failed_artifacts.append(art_path)
+
+        checkpoint.save(checkpoint_path)
+
+
+def run_zip_documents_phase(
+    zf: zipfile.ZipFile,
+    client: PenfieldClient,
+    checkpoint: ZipCheckpoint,
+    checkpoint_path: Path,
+) -> None:
+    """Import documents from documents.jsonl + documents/ directory."""
+    checkpoint.phase = "documents"
+
+    with zf.open("documents.jsonl") as f:
+        records = [json.loads(line) for line in f if line.strip()]
+
+    if not records:
+        logger.info("No documents to import")
+        checkpoint.save(checkpoint_path)
+        return
+
+    total = len(records)
+    for i, rec in enumerate(records):
+        source_id = rec["id"]
+        if source_id in checkpoint.documents:
+            continue
+
+        filename = rec["filename"]
+        mime_type = rec.get("mime_type", "application/octet-stream")
+        doc_metadata = rec.get("metadata") or {}
+        doc_tags = rec.get("tags") or []
+
+        if doc_tags:
+            logger.warning("[%d/%d] Document %r has %d tags that cannot be preserved (no API field)",
+                           i + 1, total, filename, len(doc_tags))
+
+        ext = ""
+        if "." in filename:
+            ext_candidate = filename.rsplit(".", 1)[-1]
+            if len(ext_candidate) <= 16 and "/" not in ext_candidate and "\x00" not in ext_candidate:
+                ext = ext_candidate
+
+        if ext:
+            zip_entry = f"documents/{source_id}/original.{ext}"
+        else:
+            zip_entry = f"documents/{source_id}/original"
+
+        if zip_entry not in zf.namelist():
+            logger.warning("[%d/%d] Document file missing from ZIP: %s", i + 1, total, zip_entry)
+            checkpoint.documents[source_id] = "__skipped_missing__"
+            checkpoint.save(checkpoint_path)
+            continue
+
+        raw = zf.read(zip_entry)
+
+        if len(raw) > MAX_DOCUMENT_SIZE:
+            logger.warning("[%d/%d] Skipping oversized document (%d bytes, limit %d): %s",
+                           i + 1, total, len(raw), MAX_DOCUMENT_SIZE, filename)
+            checkpoint.documents[source_id] = SKIP_OVERSIZED
+            checkpoint.save(checkpoint_path)
+            continue
+
+        logger.info("[%d/%d] Uploading document: %s (%d bytes)", i + 1, total, filename, len(raw))
+
+        try:
+            result = client.upload_document_bytes(
+                filename=filename,
+                data=raw,
+                content_type=mime_type,
+                metadata=doc_metadata if doc_metadata else None,
+            )
+            new_id = result.get("id", "")
+            checkpoint.documents[source_id] = str(new_id)
+            if source_id in checkpoint.failed_documents:
+                checkpoint.failed_documents.remove(source_id)
+        except APIError as e:
+            if e.status_code == 409:
+                logger.info("Document %r already exists, skipping", filename)
+                checkpoint.documents[source_id] = "__skipped_conflict__"
+            else:
+                logger.error("Failed to upload document %r: %s", filename, e)
+                if source_id not in checkpoint.failed_documents:
+                    checkpoint.failed_documents.append(source_id)
+
+        checkpoint.save(checkpoint_path)
+
+
+def run_zip_verify_phase(
+    client: PenfieldClient,
+    checkpoint: ZipCheckpoint,
+    manifest: dict[str, Any],
+) -> None:
+    """Verify import counts."""
+    checkpoint.phase = "verify"
+    counts = manifest.get("counts", {})
+
+    mem_imported = len(checkpoint.memory_id_map)
+    mem_skipped = len(checkpoint.skipped_memories)
+    mem_failed = len(checkpoint.failed_memories)
+    rel_done = len(checkpoint.relationships_done)
+    rel_failed = len(checkpoint.failed_relationships)
+    ctx_done = sum(1 for v in checkpoint.contexts.values() if not v.startswith("__"))
+    ctx_skipped = sum(1 for v in checkpoint.contexts.values() if v.startswith("__"))
+    ctx_failed = len(checkpoint.failed_contexts)
+    art_done = sum(1 for v in checkpoint.artifacts.values() if not v.startswith("__"))
+    art_skipped = sum(1 for v in checkpoint.artifacts.values() if v.startswith("__"))
+    art_failed = len(checkpoint.failed_artifacts)
+    doc_done = sum(1 for v in checkpoint.documents.values() if not v.startswith("__"))
+    doc_skipped = sum(1 for v in checkpoint.documents.values() if v.startswith("__"))
+    doc_failed = len(checkpoint.failed_documents)
+
+    total_failures = mem_failed + rel_failed + ctx_failed + art_failed + doc_failed
+
+    print("\n=== ZIP Import Verification ===\n")
+    print(f"Source tenant:  {manifest.get('source_tenant_id', 'unknown')}")
+    print(f"Schema version: {manifest.get('schema_version', 'unknown')}")
+    print()
+    print(f"MEMORIES:       {mem_imported} imported, {mem_skipped} skipped, {mem_failed} failed"
+          f"  (export: {counts.get('memories', '?')})")
+    print(f"RELATIONSHIPS:  {rel_done} created, {rel_failed} failed"
+          f"  (export: {counts.get('relationships', '?')})")
+    print(f"CONTEXTS:       {ctx_done} created, {ctx_skipped} skipped, {ctx_failed} failed"
+          f"  (export: {counts.get('contexts', '?')})")
+    print(f"ARTIFACTS:      {art_done} uploaded, {art_skipped} skipped, {art_failed} failed"
+          f"  (export: {counts.get('artifacts', '?')})")
+    print(f"DOCUMENTS:      {doc_done} uploaded, {doc_skipped} skipped, {doc_failed} failed"
+          f"  (export: {counts.get('documents', '?')})")
+    print()
+
+    if total_failures == 0:
+        print("NO FAILURES — clean import.")
+    else:
+        print(f"TOTAL FAILURES: {total_failures}")
+        if checkpoint.failed_memories:
+            print(f"  Failed memories: {', '.join(checkpoint.failed_memories[:10])}")
+        if checkpoint.failed_relationships:
+            print(f"  Failed relationships: {len(checkpoint.failed_relationships)}")
+        if checkpoint.failed_contexts:
+            print(f"  Failed contexts: {', '.join(checkpoint.failed_contexts[:10])}")
+        if checkpoint.failed_artifacts:
+            print(f"  Failed artifacts: {', '.join(checkpoint.failed_artifacts[:10])}")
+        if checkpoint.failed_documents:
+            print(f"  Failed documents: {', '.join(checkpoint.failed_documents[:10])}")
+
+    try:
+        actual_memories = client.get_memory_count()
+        print(f"\nServer memory count: {actual_memories}")
+    except APIError:
+        pass
+
+    print()
+
+
+def run_zip_import(
+    zip_path: Path,
+    client: Optional[PenfieldClient],
+    checkpoint_dir: Optional[Path] = None,
+    dry_run: bool = False,
+) -> int:
+    """Main entry point for ZIP/JSONL import."""
+    if checkpoint_dir is None:
+        checkpoint_dir = zip_path.parent
+    checkpoint_path = checkpoint_dir / ZIP_CHECKPOINT_FILENAME
+
+    logger.info("Opening ZIP export: %s", zip_path)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        try:
+            manifest = validate_zip_manifest(zf)
+        except ValueError as e:
+            logger.error("Invalid export ZIP: %s", e)
+            return 1
+
+        logger.info("Manifest OK — schema %s, tenant %s",
+                     manifest.get("schema_version"), manifest.get("source_tenant_id"))
+        counts = manifest.get("counts", {})
+        logger.info("Counts: %d memories, %d relationships, %d contexts, %d artifacts, %d documents",
+                     counts.get("memories", 0), counts.get("relationships", 0),
+                     counts.get("contexts", 0), counts.get("artifacts", 0),
+                     counts.get("documents", 0))
+
+        if dry_run:
+            print("\n=== ZIP Import Dry Run ===\n")
+            print(f"Source:         {zip_path.name}")
+            print(f"Schema version: {manifest.get('schema_version')}")
+            print(f"Source tenant:  {manifest.get('source_tenant_id')}")
+            print(f"Exported at:    {manifest.get('exported_at')}")
+            print()
+            print(f"Memories:       {counts.get('memories', 0)}")
+            print(f"Relationships:  {counts.get('relationships', 0)}")
+            print(f"Contexts:       {counts.get('contexts', 0)}")
+            print(f"Artifacts:      {counts.get('artifacts', 0)}")
+            print(f"Documents:      {counts.get('documents', 0)}")
+            print()
+            print("Protected type handling:")
+            print("  identity_core      → skip (API does not allow creation)")
+            print("  personality_trait   → downgrade to fact")
+            print()
+            print("Fields not preserved on round-trip:")
+            print("  surprise_score, evolution chain, lifecycle_state, timestamps, user_id")
+            print("  is_auto_detected on relationships, document tags (no API field)")
+            print()
+            return 0
+
+        checkpoint = ZipCheckpoint.load(checkpoint_path)
+
+        if checkpoint.source_tenant_id and checkpoint.source_tenant_id != manifest.get("source_tenant_id"):
+            logger.error("Checkpoint tenant %s does not match ZIP tenant %s — delete checkpoint to restart",
+                         checkpoint.source_tenant_id, manifest.get("source_tenant_id"))
+            return 1
+
+        checkpoint.source_tenant_id = manifest.get("source_tenant_id", "")
+        checkpoint.schema_version = manifest.get("schema_version", "")
+
+        if checkpoint.phase == "done":
+            logger.info("Previous ZIP import completed. Use --reset for a fresh import.")
+            return 0
+
+        if _zip_phase_index(checkpoint.phase) <= _zip_phase_index("memories"):
+            run_zip_memories_phase(zf, client, checkpoint, checkpoint_path)
+
+        if _zip_phase_index(checkpoint.phase) <= _zip_phase_index("relationships"):
+            run_zip_relationships_phase(zf, client, checkpoint, checkpoint_path)
+
+        if _zip_phase_index(checkpoint.phase) <= _zip_phase_index("contexts"):
+            run_zip_contexts_phase(zf, client, checkpoint, checkpoint_path)
+
+        if _zip_phase_index(checkpoint.phase) <= _zip_phase_index("artifacts"):
+            run_zip_artifacts_phase(zf, client, checkpoint, checkpoint_path)
+
+        if _zip_phase_index(checkpoint.phase) <= _zip_phase_index("documents"):
+            run_zip_documents_phase(zf, client, checkpoint, checkpoint_path)
+
+        run_zip_verify_phase(client, checkpoint, manifest)
+
+        checkpoint.phase = "done"
+        checkpoint.save(checkpoint_path)
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1737,9 +2495,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="penfield-import",
         description=(
-            "Import a directory of markdown and text files into Penfield as memories, "
-            "relationships, and artifacts. For best results with typed relationships, "
-            "use obsidian-wikilink-types."
+            "Import into Penfield from a Penfield export ZIP file or a directory of "
+            "markdown/text files (Obsidian vault). For vault imports with typed "
+            "relationships, use obsidian-wikilink-types."
         ),
     )
     parser.add_argument(
@@ -1747,7 +2505,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         nargs="?",
         default=None,
-        help="Path to the directory of .md/.txt files to import",
+        metavar="INPUT_PATH",
+        help="Path to a Penfield export .zip file or a directory of .md/.txt files",
     )
     parser.add_argument(
         "--base-url",
@@ -1910,7 +2669,7 @@ def write_import_report(
         "",
         "ARTIFACTS:",
         f"  Uploaded:     {art_uploaded + vault_art_uploaded}",
-        f"  Skipped:      {art_skipped + vault_art_skipped} (binary/unsafe)",
+        f"  Skipped:      {art_skipped + vault_art_skipped} (binary/unsafe/oversized)",
         f"  Failed:       {art_failed + vault_art_failed}",
         "",
         "DOCUMENTS:",
@@ -2028,15 +2787,60 @@ def main() -> int:
             print(f"Cache file:    {status['cache_file']}")
         return 0
 
-    # --- Vault import requires vault_path ---
+    # --- Import requires input path ---
     if args.vault_path is None:
-        logger.error("vault_path is required for import (use --login, --logout, or --auth-status for auth management)")
+        logger.error("INPUT_PATH is required for import (use --login, --logout, or --auth-status for auth management)")
         return 1
 
-    # Validate vault path
-    vault_path = args.vault_path.resolve()
+    input_path = args.vault_path.resolve()
+
+    # --- ZIP import path ---
+    if input_path.is_file() and input_path.suffix.lower() == ".zip":
+        cp_dir = (args.checkpoint_dir or input_path.parent).resolve()
+        cp_dir.mkdir(parents=True, exist_ok=True)
+
+        if args.reset:
+            zcp = cp_dir / ZIP_CHECKPOINT_FILENAME
+            if zcp.exists():
+                zcp.unlink()
+                logger.info("ZIP checkpoint deleted")
+
+        if args.dry_run:
+            return run_zip_import(input_path, None, checkpoint_dir=cp_dir, dry_run=True)
+
+        auth = _resolve_auth(args)
+        if auth is None:
+            logger.error(
+                "No authentication available. Either:\n"
+                "  1. Run: penfield-import --login\n"
+                "  2. Set PENFIELD_API_KEY environment variable"
+            )
+            return 1
+
+        _oauth_refresh_cb = None
+        if auth.access_token and _penfield_auth is not None:
+            _zip_api_url = auth.api_url
+
+            def _oauth_refresh_cb() -> Optional[tuple[str, Optional[int]]]:
+                result = _penfield_auth.refresh_oauth_token(api_url=_zip_api_url)
+                if result:
+                    return result.access_token, result.expires_in
+                return None
+
+        client = PenfieldClient(
+            base_url=auth.api_url,
+            api_key=auth.api_key,
+            access_token=auth.access_token,
+            token_expiry_seconds=auth.token_expiry_seconds,
+            on_token_refresh=_oauth_refresh_cb,
+        )
+
+        return run_zip_import(input_path, client, checkpoint_dir=cp_dir, dry_run=False)
+
+    # --- Vault import path ---
+    vault_path = input_path
     if not vault_path.is_dir():
-        logger.error("Vault path does not exist or is not a directory: %s", vault_path)
+        logger.error("Input path must be a .zip file or a directory: %s", vault_path)
         return 1
 
     # Checkpoint setup

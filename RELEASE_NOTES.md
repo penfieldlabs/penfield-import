@@ -1,20 +1,24 @@
-# Penfield Import v1.0.2
+# Penfield Import v2.0.0
 
-Import your Obsidian vault, markdown collection, or any folder of `.md` and `.txt` files into [Penfield](https://penfield.app) as searchable memories with a full knowledge graph.
+Import Penfield portal exports or Obsidian vaults into [Penfield](https://penfield.app).
 
-## What's new in v1.0.2
+## What's new in v2.0.0
 
-- **Path safety validation** — All file upload paths (oversized-note artifacts, vault artifacts, documents) are now validated before sending to the API. Paths containing null bytes, colons, directory traversal sequences, Windows reserved device names (CON, PRN, NUL, AUX, COM1–9, LPT1–9 — regardless of extension), or exceeding 1024 UTF-8 bytes are blocked. Skipped files are checkpointed so they are never re-attempted on resume.
+- **ZIP/JSONL import** — Penfield portal exports (v1 ZIP archives) can now be imported directly. The tool validates the manifest, processes all five JSONL data files in phase order (memories → relationships → contexts → artifacts → documents), and checkpoints after each record for crash safety.
+- **Protected type handling** — `identity_core` memories are skipped (the API does not allow creation). `personality_trait` memories are downgraded to `fact` with a prefix note.
+- **Context reconstruction** — Exported contexts are recreated as `checkpoint` memories via the memories API, preserving checkpoint names and remapped memory references.
+- **Binary artifact detection** — Artifacts with null bytes in the first 8 KB are correctly uploaded as binary instead of being misidentified as UTF-8 text.
+- **Artifact size validation** — Artifacts exceeding the 1 MB API limit are skipped with a warning and checkpointed so they are never re-attempted on resume.
+- **Ambiguous filename collision fix** — Vault imports with duplicate filenames across directories now skip ambiguous relationship targets with a warning instead of resolving them arbitrarily.
+- **Extended memory creation** — `memory_type`, `importance`, `confidence`, `source_type`, and `metadata` are now passed through to the API when present in export data.
 
-## What it does
+## Fields not preserved on round-trip
 
-- Imports markdown and text files as Penfield memories
-- Extracts typed relationships from YAML frontmatter (using the [obsidian-wikilink-types](https://github.com/penfieldlabs/obsidian-wikilink-types) vocabulary) and builds a knowledge graph
-- Handles notes over 10,000 characters by creating a searchable summary memory with the full content stored as a retrievable artifact
-- Optionally summarizes oversized notes with an LLM (OpenAI-compatible APIs or Claude Code CLI) instead of truncating
-- Preserves YAML frontmatter metadata in memory content with `--include-frontmatter`
-- Uploads pre-existing artifact files and documents from the vault
-- Supports incremental imports for vaults in a git repository — only new files are imported on subsequent runs
+The following fields are present in exports but assigned server-side and cannot be set via the API:
+
+- Timestamps (`created_at`, `updated_at`) on memories, relationships, and documents
+- Ownership (`user_id` on memories, `created_by` on relationships, `uploaded_by` on documents)
+- `is_auto_detected` on relationships
 
 ## Authentication
 
@@ -24,7 +28,7 @@ Two options:
 
 ## Crash safety
 
-Every operation is checkpointed. If the import is interrupted, re-run the same command and it picks up where it left off. No duplicate memories, no lost progress.
+Every operation is checkpointed. If the import is interrupted, re-run the same command and it picks up where it left off. ZIP and vault imports use separate checkpoint files so they don't interfere.
 
 ## Requirements
 

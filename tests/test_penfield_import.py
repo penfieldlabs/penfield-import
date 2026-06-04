@@ -970,12 +970,41 @@ class TestBuildRelationshipList:
         with caplog.at_level("WARNING"):
             result = vtp.build_relationship_list(notes, checkpoint)
         assert "Duplicate filename" in caplog.text
+        assert "skipped (ambiguous)" in caplog.text
         # dir2/test.md has the relationship; "other" resolves to "other.md"
         assert len(result) == 1
         _, payload = result[0]
         assert payload["from_id"] == "id-2"
         assert payload["to_id"] == "id-other"
         assert payload["relationship_type"] == "supports"
+
+    def test_ambiguous_target_skipped(self, caplog):
+        """Relationships targeting an ambiguous filename stem are skipped."""
+        checkpoint = vtp.Checkpoint(memories={
+            "dir1/plan.md": "id-plan-1",
+            "dir2/plan.md": "id-plan-2",
+            "source.md": "id-source",
+        })
+        notes = [
+            vtp.ParsedNote(
+                rel_path="dir1/plan.md", filename="plan", vault_dir="dir1",
+                content="", body="", frontmatter={}, relationships=[], tags=[],
+            ),
+            vtp.ParsedNote(
+                rel_path="dir2/plan.md", filename="plan", vault_dir="dir2",
+                content="", body="", frontmatter={}, relationships=[], tags=[],
+            ),
+            vtp.ParsedNote(
+                rel_path="source.md", filename="source", vault_dir="",
+                content="", body="",
+                frontmatter={"supports": ["[[plan]]"]},
+                relationships=[("plan", "supports")], tags=[],
+            ),
+        ]
+        with caplog.at_level("WARNING"):
+            result = vtp.build_relationship_list(notes, checkpoint)
+        assert "Duplicate filename 'plan'" in caplog.text
+        assert len(result) == 0
 
     def test_handles_missing_memory_ids(self):
         """Handles missing memory IDs (skips gracefully)."""
@@ -2115,6 +2144,728 @@ class TestPathSafetyDocuments:
 
         mock_client.upload_document.assert_called_once()
         assert "report.pdf" in cp.documents
+
+
+# ============================================================================
+# ZIP IMPORT TESTS
+# ============================================================================
+
+import io
+import zipfile
+
+
+def _make_zip(contents: dict[str, Any]) -> bytes:
+    """Build an in-memory ZIP from {filename: content}. Dicts/lists become JSON."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in contents.items():
+            if isinstance(data, (dict, list)):
+                zf.writestr(name, json.dumps(data))
+            elif isinstance(data, bytes):
+                zf.writestr(name, data)
+            else:
+                zf.writestr(name, str(data))
+    return buf.getvalue()
+
+
+def _make_export_zip(
+    memories=None, relationships=None, contexts=None,
+    artifacts_meta=None, documents_meta=None,
+    artifact_files=None, document_files=None,
+    manifest_overrides=None,
+):
+    """Build a valid Penfield export ZIP with sensible defaults."""
+    memories = memories or []
+    relationships = relationships or []
+    contexts = contexts or []
+    artifacts_meta = artifacts_meta or []
+    documents_meta = documents_meta or []
+    artifact_files = artifact_files or {}
+    document_files = document_files or {}
+
+    manifest = {
+        "schema_version": "1.0.0",
+        "exported_at": "2026-06-01T00:00:00Z",
+        "snapshot_at": "2026-06-01T00:00:00Z",
+        "source_tenant_id": "pf_test_tenant",
+        "source_user_id": "test-user",
+        "counts": {
+            "memories": len(memories),
+            "relationships": len(relationships),
+            "contexts": len(contexts),
+            "artifacts": len(artifacts_meta),
+            "documents": len(documents_meta),
+        },
+        "include_filters": {},
+    }
+    if manifest_overrides:
+        manifest.update(manifest_overrides)
+
+    contents = {
+        "manifest.json": manifest,
+        "memories.jsonl": "\n".join(json.dumps(r) for r in memories) + ("\n" if memories else ""),
+        "relationships.jsonl": "\n".join(json.dumps(r) for r in relationships) + ("\n" if relationships else ""),
+        "contexts.jsonl": "\n".join(json.dumps(r) for r in contexts) + ("\n" if contexts else ""),
+        "artifacts.jsonl": "\n".join(json.dumps(r) for r in artifacts_meta) + ("\n" if artifacts_meta else ""),
+        "documents.jsonl": "\n".join(json.dumps(r) for r in documents_meta) + ("\n" if documents_meta else ""),
+    }
+    # Fix: empty JSONL files should be truly empty (no trailing newline)
+    for key in ["memories.jsonl", "relationships.jsonl", "contexts.jsonl", "artifacts.jsonl", "documents.jsonl"]:
+        section = key.replace(".jsonl", "")
+        if manifest["counts"][section] == 0:
+            contents[key] = ""
+
+    contents.update(artifact_files)
+    contents.update(document_files)
+
+    return _make_zip(contents)
+
+
+class TestZipManifest:
+    def test_valid_manifest(self, tmp_path):
+        data = _make_export_zip()
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        manifest = vtp.validate_zip_manifest(zf)
+        assert manifest["schema_version"] == "1.0.0"
+        assert manifest["source_tenant_id"] == "pf_test_tenant"
+
+    def test_rejects_v2_schema(self, tmp_path):
+        data = _make_export_zip(manifest_overrides={"schema_version": "2.0.0"})
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        with pytest.raises(ValueError, match="Unsupported schema version"):
+            vtp.validate_zip_manifest(zf)
+
+    def test_accepts_v1x_schema(self):
+        data = _make_export_zip(manifest_overrides={"schema_version": "1.1.0"})
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        manifest = vtp.validate_zip_manifest(zf)
+        assert manifest["schema_version"] == "1.1.0"
+
+    def test_missing_manifest(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("memories.jsonl", "")
+        zf = zipfile.ZipFile(io.BytesIO(buf.getvalue()))
+        with pytest.raises(ValueError, match="missing manifest.json"):
+            vtp.validate_zip_manifest(zf)
+
+    def test_missing_jsonl_file(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("manifest.json", json.dumps({
+                "schema_version": "1.0.0",
+                "counts": {"memories": 0, "relationships": 0, "contexts": 0, "artifacts": 0, "documents": 0},
+            }))
+            zf.writestr("memories.jsonl", "")
+            zf.writestr("relationships.jsonl", "")
+            zf.writestr("contexts.jsonl", "")
+            zf.writestr("artifacts.jsonl", "")
+            # documents.jsonl missing
+        zf = zipfile.ZipFile(io.BytesIO(buf.getvalue()))
+        with pytest.raises(ValueError, match="missing required file.*documents.jsonl"):
+            vtp.validate_zip_manifest(zf)
+
+    def test_count_mismatch(self):
+        memories = [{"id": "m1", "content": "test", "memory_type": "fact"}]
+        data = _make_export_zip(memories=memories, manifest_overrides={
+            "counts": {"memories": 5, "relationships": 0, "contexts": 0, "artifacts": 0, "documents": 0},
+        })
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        with pytest.raises(ValueError, match="Count mismatch.*memories"):
+            vtp.validate_zip_manifest(zf)
+
+
+class TestZipCheckpoint:
+    def test_round_trip(self, tmp_path):
+        cp = vtp.ZipCheckpoint(
+            phase="memories",
+            memory_id_map={"old-1": "new-1"},
+            relationships_done={"rel-1"},
+            source_tenant_id="pf_test",
+        )
+        path = tmp_path / "cp.json"
+        cp.save(path)
+        loaded = vtp.ZipCheckpoint.load(path)
+        assert loaded.phase == "memories"
+        assert loaded.memory_id_map == {"old-1": "new-1"}
+        assert loaded.relationships_done == {"rel-1"}
+        assert loaded.source_tenant_id == "pf_test"
+
+    def test_fresh_on_missing(self, tmp_path):
+        cp = vtp.ZipCheckpoint.load(tmp_path / "nonexistent.json")
+        assert cp.phase == "manifest"
+        assert cp.memory_id_map == {}
+
+    def test_fresh_on_corrupt(self, tmp_path):
+        path = tmp_path / "cp.json"
+        path.write_text("not json{{{", encoding="utf-8")
+        cp = vtp.ZipCheckpoint.load(path)
+        assert cp.phase == "manifest"
+
+
+class TestZipMemoriesPhase:
+    def _make_client(self, new_id="new-uuid"):
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.create_memory.return_value = new_id
+        return client
+
+    def test_creates_memory_with_full_fields(self, tmp_path):
+        memories = [{
+            "id": "src-1", "content": "Test fact", "memory_type": "fact",
+            "source_type": "direct_input", "importance": 0.7, "confidence": 0.9,
+            "tags": ["test"], "metadata": {"key": "val"},
+            "user_id": "u1", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        }]
+        data = _make_export_zip(memories=memories)
+        client = self._make_client("new-1")
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_memories_phase(zf, client, cp, cp_path)
+
+        client.create_memory.assert_called_once_with(
+            content="Test fact", tags=["test"], memory_type="fact",
+            importance=0.7, confidence=0.9, source_type="direct_input",
+            metadata={"key": "val"},
+        )
+        assert cp.memory_id_map["src-1"] == "new-1"
+
+    def test_skips_identity_core(self, tmp_path):
+        memories = [{"id": "ic-1", "content": "identity", "memory_type": "identity_core"}]
+        data = _make_export_zip(memories=memories)
+        client = self._make_client()
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_memories_phase(zf, client, cp, cp_path)
+
+        client.create_memory.assert_not_called()
+        assert cp.skipped_memories["ic-1"] == "identity_core"
+        assert "ic-1" not in cp.memory_id_map
+
+    def test_downgrades_personality_trait(self, tmp_path):
+        memories = [{"id": "pt-1", "content": "I am friendly", "memory_type": "personality_trait"}]
+        data = _make_export_zip(memories=memories)
+        client = self._make_client("new-pt")
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_memories_phase(zf, client, cp, cp_path)
+
+        call_kwargs = client.create_memory.call_args
+        assert call_kwargs.kwargs["memory_type"] == "fact"
+        assert "[Imported personality_trait]" in call_kwargs.kwargs["content"]
+        assert cp.memory_id_map["pt-1"] == "new-pt"
+
+    def test_resume_skips_already_imported(self, tmp_path):
+        memories = [{"id": "src-1", "content": "test", "memory_type": "fact"}]
+        data = _make_export_zip(memories=memories)
+        client = self._make_client()
+        cp = vtp.ZipCheckpoint()
+        cp.memory_id_map["src-1"] = "already-done"
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_memories_phase(zf, client, cp, cp_path)
+
+        client.create_memory.assert_not_called()
+
+    def test_api_error_tracked(self, tmp_path):
+        memories = [{"id": "fail-1", "content": "test", "memory_type": "fact"}]
+        data = _make_export_zip(memories=memories)
+        client = self._make_client()
+        client.create_memory.side_effect = vtp.APIError(500, "server error", "/memories")
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_memories_phase(zf, client, cp, cp_path)
+
+        assert "fail-1" in cp.failed_memories
+        assert "fail-1" not in cp.memory_id_map
+
+
+class TestZipRelationshipsPhase:
+    def test_remaps_ids(self, tmp_path):
+        rels = [{
+            "id": "r1", "from_id": "old-a", "to_id": "old-b",
+            "relationship_type": "supports", "direction_type": "DIRECTED",
+            "strength": 0.8, "confidence": 0.9,
+            "is_auto_detected": False, "metadata": {"note": "test"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        }]
+        data = _make_export_zip(relationships=rels)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.create_relationships_bulk.return_value = {}
+        cp = vtp.ZipCheckpoint()
+        cp.memory_id_map = {"old-a": "new-a", "old-b": "new-b"}
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_relationships_phase(zf, client, cp, cp_path)
+
+        payload = client.create_relationships_bulk.call_args[0][0][0]
+        assert payload["from_id"] == "new-a"
+        assert payload["to_id"] == "new-b"
+        assert payload["relationship_type"] == "supports"
+        assert payload["direction_type"] == "DIRECTED"
+        assert payload["strength"] == 0.8
+        assert payload["relationship_metadata"] == {"note": "test"}
+        assert "r1" in cp.relationships_done
+
+    def test_skips_dangling_from_id(self, tmp_path, caplog):
+        rels = [{"id": "r1", "from_id": "missing", "to_id": "old-b", "relationship_type": "supports"}]
+        data = _make_export_zip(relationships=rels)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp.memory_id_map = {"old-b": "new-b"}
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_relationships_phase(zf, client, cp, cp_path)
+
+        client.create_relationships_bulk.assert_not_called()
+        assert "r1" in cp.relationships_done
+
+    def test_skips_dangling_to_id(self, tmp_path, caplog):
+        rels = [{"id": "r1", "from_id": "old-a", "to_id": "missing", "relationship_type": "supports"}]
+        data = _make_export_zip(relationships=rels)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp.memory_id_map = {"old-a": "new-a"}
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_relationships_phase(zf, client, cp, cp_path)
+
+        client.create_relationships_bulk.assert_not_called()
+
+    def test_empty_relationships(self, tmp_path):
+        data = _make_export_zip()
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_relationships_phase(zf, client, cp, cp_path)
+
+        client.create_relationships_bulk.assert_not_called()
+
+
+class TestZipContextsPhase:
+    def test_creates_checkpoint_memory(self, tmp_path):
+        contexts = [{
+            "id": "ctx-1", "name": "test-context", "description": "A test",
+            "memory_count": 2, "memory_ids": ["m1", "m2"],
+            "created_at": "2026-01-01T00:00:00Z",
+        }]
+        data = _make_export_zip(contexts=contexts)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.create_memory.return_value = "new-ctx"
+        cp = vtp.ZipCheckpoint()
+        cp.memory_id_map = {"m1": "new-m1", "m2": "new-m2"}
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_contexts_phase(zf, client, cp, cp_path)
+
+        call_kwargs = client.create_memory.call_args.kwargs
+        assert call_kwargs["memory_type"] == "checkpoint"
+        assert call_kwargs["importance"] == 0.9
+        assert call_kwargs["tags"] == ["context", "checkpoint", "test-context"]
+        assert call_kwargs["metadata"]["checkpoint_name"] == "test-context"
+
+        content = json.loads(call_kwargs["content"])
+        assert content["memory_ids"] == ["new-m1", "new-m2"]
+        assert content["memory_count"] == 2
+        assert cp.contexts["ctx-1"] == "new-ctx"
+
+    def test_skips_all_dangling(self, tmp_path, caplog):
+        contexts = [{
+            "id": "ctx-1", "name": "orphan", "description": "",
+            "memory_count": 2, "memory_ids": ["gone1", "gone2"],
+            "created_at": "2026-01-01T00:00:00Z",
+        }]
+        data = _make_export_zip(contexts=contexts)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_contexts_phase(zf, client, cp, cp_path)
+
+        client.create_memory.assert_not_called()
+        assert cp.contexts["ctx-1"] == "__skipped_dangling__"
+
+    def test_partial_dangling_warns(self, tmp_path, caplog):
+        contexts = [{
+            "id": "ctx-1", "name": "partial", "description": "",
+            "memory_count": 3, "memory_ids": ["m1", "gone", "m2"],
+            "created_at": "2026-01-01T00:00:00Z",
+        }]
+        data = _make_export_zip(contexts=contexts)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.create_memory.return_value = "new-ctx"
+        cp = vtp.ZipCheckpoint()
+        cp.memory_id_map = {"m1": "new-m1", "m2": "new-m2"}
+        cp_path = tmp_path / "cp.json"
+
+        with caplog.at_level("WARNING"):
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                vtp.run_zip_contexts_phase(zf, client, cp, cp_path)
+
+        assert "1 of 3 memory_ids are dangling" in caplog.text
+        content = json.loads(client.create_memory.call_args.kwargs["content"])
+        assert len(content["memory_ids"]) == 2
+
+    def test_409_conflict_handled(self, tmp_path):
+        contexts = [{
+            "id": "ctx-1", "name": "existing", "description": "",
+            "memory_count": 0, "memory_ids": [],
+            "created_at": "2026-01-01T00:00:00Z",
+        }]
+        data = _make_export_zip(contexts=contexts)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.create_memory.side_effect = vtp.APIError(409, "conflict", "/memories")
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_contexts_phase(zf, client, cp, cp_path)
+
+        assert cp.contexts["ctx-1"] == "__skipped_conflict__"
+
+
+class TestZipArtifactsPhase:
+    def test_uploads_text_artifact(self, tmp_path):
+        artifacts_meta = [{"path": "/readme.md", "content_type": "text/markdown", "size_bytes": 5}]
+        artifact_files = {"artifacts/readme.md": b"hello"}
+        data = _make_export_zip(artifacts_meta=artifacts_meta, artifact_files=artifact_files)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.create_artifact.return_value = {}
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_artifacts_phase(zf, client, cp, cp_path)
+
+        client.create_artifact.assert_called_once_with("/readme.md", "hello")
+        assert cp.artifacts["/readme.md"] == "/readme.md"
+
+    def test_skips_binary_artifact(self, tmp_path):
+        artifacts_meta = [{"path": "/image.png", "content_type": "image/png", "size_bytes": 10}]
+        artifact_files = {"artifacts/image.png": b"\x89PNG\x00\x00\x00\x00\x00\x00"}
+        data = _make_export_zip(artifacts_meta=artifacts_meta, artifact_files=artifact_files)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_artifacts_phase(zf, client, cp, cp_path)
+
+        client.create_artifact.assert_not_called()
+        assert cp.artifacts["/image.png"] == vtp.SKIP_BINARY
+
+    def test_skips_oversized_artifact(self, tmp_path):
+        big_content = b"x" * (vtp.ARTIFACT_SIZE_LIMIT + 1)
+        artifacts_meta = [{"path": "/big.txt", "content_type": "text/plain", "size_bytes": len(big_content)}]
+        artifact_files = {"artifacts/big.txt": big_content}
+        data = _make_export_zip(artifacts_meta=artifacts_meta, artifact_files=artifact_files)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_artifacts_phase(zf, client, cp, cp_path)
+
+        client.create_artifact.assert_not_called()
+        assert cp.artifacts["/big.txt"] == vtp.SKIP_OVERSIZED
+
+    def test_skips_unsafe_path(self, tmp_path):
+        artifacts_meta = [{"path": "/../etc/passwd", "content_type": "text/plain", "size_bytes": 5}]
+        data = _make_export_zip(artifacts_meta=artifacts_meta)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_artifacts_phase(zf, client, cp, cp_path)
+
+        client.create_artifact.assert_not_called()
+
+    def test_skips_invalid_path_chars(self, tmp_path):
+        artifacts_meta = [{"path": "/my file (1).txt", "content_type": "text/plain", "size_bytes": 5}]
+        artifact_files = {"artifacts/my file (1).txt": b"hello"}
+        data = _make_export_zip(artifacts_meta=artifacts_meta, artifact_files=artifact_files)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_artifacts_phase(zf, client, cp, cp_path)
+
+        client.create_artifact.assert_not_called()
+
+    def test_missing_zip_entry(self, tmp_path):
+        artifacts_meta = [{"path": "/ghost.txt", "content_type": "text/plain", "size_bytes": 5}]
+        data = _make_export_zip(artifacts_meta=artifacts_meta)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_artifacts_phase(zf, client, cp, cp_path)
+
+        client.create_artifact.assert_not_called()
+        assert cp.artifacts["/ghost.txt"] == "__skipped_missing__"
+
+    def test_409_conflict(self, tmp_path):
+        artifacts_meta = [{"path": "/exists.md", "content_type": "text/markdown", "size_bytes": 5}]
+        artifact_files = {"artifacts/exists.md": b"hello"}
+        data = _make_export_zip(artifacts_meta=artifacts_meta, artifact_files=artifact_files)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.create_artifact.side_effect = vtp.APIError(409, "exists", "/artifacts")
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_artifacts_phase(zf, client, cp, cp_path)
+
+        assert cp.artifacts["/exists.md"] == "/exists.md"
+
+
+class TestZipDocumentsPhase:
+    def test_uploads_document(self, tmp_path):
+        docs_meta = [{
+            "id": "doc-1", "filename": "report.pdf", "mime_type": "application/pdf",
+            "file_size": 100, "metadata": {"source": "test"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        }]
+        doc_files = {"documents/doc-1/original.pdf": b"%PDF-fake"}
+        data = _make_export_zip(documents_meta=docs_meta, document_files=doc_files)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.upload_document_bytes.return_value = {"id": "new-doc-1"}
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_documents_phase(zf, client, cp, cp_path)
+
+        client.upload_document_bytes.assert_called_once()
+        call_kwargs = client.upload_document_bytes.call_args.kwargs
+        assert call_kwargs["filename"] == "report.pdf"
+        assert call_kwargs["content_type"] == "application/pdf"
+        assert call_kwargs["metadata"] == {"source": "test"}
+        assert cp.documents["doc-1"] == "new-doc-1"
+
+    def test_warns_about_lost_tags(self, tmp_path, caplog):
+        docs_meta = [{
+            "id": "doc-1", "filename": "tagged.pdf", "mime_type": "application/pdf",
+            "file_size": 100, "tags": ["important", "review"],
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        }]
+        doc_files = {"documents/doc-1/original.pdf": b"data"}
+        data = _make_export_zip(documents_meta=docs_meta, document_files=doc_files)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.upload_document_bytes.return_value = {"id": "new-1"}
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with caplog.at_level("WARNING"):
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                vtp.run_zip_documents_phase(zf, client, cp, cp_path)
+
+        assert "2 tags that cannot be preserved" in caplog.text
+
+    def test_missing_zip_entry(self, tmp_path):
+        docs_meta = [{
+            "id": "doc-1", "filename": "ghost.pdf", "mime_type": "application/pdf",
+            "file_size": 100,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        }]
+        data = _make_export_zip(documents_meta=docs_meta)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_documents_phase(zf, client, cp, cp_path)
+
+        client.upload_document_bytes.assert_not_called()
+        assert cp.documents["doc-1"] == "__skipped_missing__"
+
+    def test_oversized_document_skipped(self, tmp_path):
+        docs_meta = [{
+            "id": "doc-1", "filename": "huge.bin", "mime_type": "application/octet-stream",
+            "file_size": vtp.MAX_DOCUMENT_SIZE + 1,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        }]
+        big_data = b"x" * (vtp.MAX_DOCUMENT_SIZE + 1)
+        doc_files = {"documents/doc-1/original.bin": big_data}
+        data = _make_export_zip(documents_meta=docs_meta, document_files=doc_files)
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        cp = vtp.ZipCheckpoint()
+        cp_path = tmp_path / "cp.json"
+
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.run_zip_documents_phase(zf, client, cp, cp_path)
+
+        client.upload_document_bytes.assert_not_called()
+        assert cp.documents["doc-1"] == vtp.SKIP_OVERSIZED
+
+
+class TestZipImportEndToEnd:
+    def test_dry_run(self, tmp_path):
+        memories = [{"id": "m1", "content": "test", "memory_type": "fact"}]
+        data = _make_export_zip(memories=memories)
+        zip_path = tmp_path / "export.zip"
+        zip_path.write_bytes(data)
+
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        result = vtp.run_zip_import(zip_path, client, checkpoint_dir=tmp_path, dry_run=True)
+
+        assert result == 0
+        client.create_memory.assert_not_called()
+
+    def test_dry_run_no_client(self, tmp_path):
+        memories = [{"id": "m1", "content": "test", "memory_type": "fact"}]
+        data = _make_export_zip(memories=memories)
+        zip_path = tmp_path / "export.zip"
+        zip_path.write_bytes(data)
+
+        result = vtp.run_zip_import(zip_path, None, checkpoint_dir=tmp_path, dry_run=True)
+        assert result == 0
+
+    def test_full_import(self, tmp_path):
+        memories = [
+            {"id": "m1", "content": "Fact one", "memory_type": "fact",
+             "source_type": "direct_input", "importance": 0.5, "confidence": 0.8,
+             "tags": [], "metadata": {},
+             "user_id": "u1", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"},
+            {"id": "m2", "content": "Fact two", "memory_type": "fact",
+             "source_type": "direct_input", "importance": 0.5, "confidence": 0.8,
+             "tags": [], "metadata": {},
+             "user_id": "u1", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"},
+        ]
+        rels = [{
+            "id": "r1", "from_id": "m1", "to_id": "m2",
+            "relationship_type": "supports", "direction_type": "DIRECTED",
+            "strength": 0.8, "confidence": 0.9,
+            "is_auto_detected": False, "metadata": {},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        }]
+        artifacts_meta = [{"path": "/notes.md", "content_type": "text/markdown", "size_bytes": 11}]
+        artifact_files = {"artifacts/notes.md": b"# My Notes\n"}
+
+        data = _make_export_zip(
+            memories=memories, relationships=rels,
+            artifacts_meta=artifacts_meta, artifact_files=artifact_files,
+        )
+        zip_path = tmp_path / "export.zip"
+        zip_path.write_bytes(data)
+
+        call_count = [0]
+        def mock_create_memory(**kwargs):
+            call_count[0] += 1
+            return f"new-{call_count[0]}"
+
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.create_memory.side_effect = mock_create_memory
+        client.create_relationships_bulk.return_value = {}
+        client.create_artifact.return_value = {}
+        client.get_memory_count.return_value = 2
+
+        result = vtp.run_zip_import(zip_path, client, checkpoint_dir=tmp_path)
+
+        assert result == 0
+        assert client.create_memory.call_count == 2
+        assert client.create_relationships_bulk.call_count == 1
+        assert client.create_artifact.call_count == 1
+
+        cp = vtp.ZipCheckpoint.load(tmp_path / vtp.ZIP_CHECKPOINT_FILENAME)
+        assert cp.phase == "done"
+        assert len(cp.memory_id_map) == 2
+
+    def test_invalid_zip_returns_1(self, tmp_path):
+        data = _make_export_zip(manifest_overrides={"schema_version": "2.0.0"})
+        zip_path = tmp_path / "bad.zip"
+        zip_path.write_bytes(data)
+
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        result = vtp.run_zip_import(zip_path, client, checkpoint_dir=tmp_path)
+        assert result == 1
+
+    def test_tenant_mismatch_returns_1(self, tmp_path):
+        data = _make_export_zip()
+        zip_path = tmp_path / "export.zip"
+        zip_path.write_bytes(data)
+
+        cp = vtp.ZipCheckpoint(source_tenant_id="pf_other_tenant")
+        cp_path = tmp_path / vtp.ZIP_CHECKPOINT_FILENAME
+        cp.save(cp_path)
+
+        client = mock.MagicMock(spec=vtp.PenfieldClient)
+        result = vtp.run_zip_import(zip_path, client, checkpoint_dir=tmp_path)
+        assert result == 1
+
+
+class TestCreateMemoryExtended:
+    """Verify extended create_memory params are backward compatible."""
+
+    def test_vault_style_call(self):
+        client = vtp.PenfieldClient.__new__(vtp.PenfieldClient)
+        client._base_url = "http://test/api/v2"
+        client._access_token = "tok"
+        client._api_key = "key"
+        client._rate_limiter = mock.MagicMock()
+        client.request = mock.MagicMock(return_value={"data": {"id": "uuid-1"}})
+
+        result = client.create_memory(content="test", tags=["t"], memory_type="fact")
+
+        payload = client.request.call_args[0][2]
+        assert payload == {"content": "test", "tags": ["t"], "memory_type": "fact"}
+        assert "importance" not in payload
+        assert result == "uuid-1"
+
+    def test_zip_style_call(self):
+        client = vtp.PenfieldClient.__new__(vtp.PenfieldClient)
+        client._base_url = "http://test/api/v2"
+        client._access_token = "tok"
+        client._api_key = "key"
+        client._rate_limiter = mock.MagicMock()
+        client.request = mock.MagicMock(return_value={"data": {"id": "uuid-2"}})
+
+        result = client.create_memory(
+            content="test", tags=["t"], memory_type="fact",
+            importance=0.7, confidence=0.9, source_type="direct_input",
+            metadata={"key": "val"},
+        )
+
+        payload = client.request.call_args[0][2]
+        assert payload["importance"] == 0.7
+        assert payload["confidence"] == 0.9
+        assert payload["source_type"] == "direct_input"
+        assert payload["metadata"] == {"key": "val"}
+        assert result == "uuid-2"
+
+
+class TestUploadDocumentBytes:
+    def test_delegates_from_path(self):
+        client = vtp.PenfieldClient.__new__(vtp.PenfieldClient)
+        client.upload_document_bytes = mock.MagicMock(return_value={"id": "doc-1"})
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(b"fake pdf")
+            f.flush()
+            result = client.upload_document(Path(f.name))
+
+        client.upload_document_bytes.assert_called_once()
+        call_args = client.upload_document_bytes.call_args
+        assert call_args.args[0].endswith(".pdf")
+        assert call_args.args[1] == b"fake pdf"
 
 
 if __name__ == "__main__":

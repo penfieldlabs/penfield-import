@@ -1,12 +1,48 @@
 # Penfield Import
 
-Import your [Obsidian](https://obsidian.md) vault into [Penfield](https://penfield.app) as memories, relationships, and artifacts.
+Import into [Penfield](https://penfield.app) from two sources:
+
+1. **Penfield portal exports** — ZIP archives produced by the Penfield web portal (EXPORT_FORMAT_SPEC_v1). Restores memories, relationships, contexts, artifacts, and documents into a new tenant.
+2. **Obsidian vaults / markdown directories** — Any collection of `.md` or `.txt` files (Obsidian, Foam, Logseq, Zettelkasten, or plain folders).
 
 Built for Obsidian users and the [obsidian-wikilink-types](https://github.com/penfieldlabs/obsidian-wikilink-types) plugin. Also works on any collection of `.md` or `.txt` files - Foam workspaces, Logseq exports, Zettelkasten directories, or plain folders of notes. More file types coming soon.
 
-For the richest import, use [obsidian-wikilink-types](https://github.com/penfieldlabs/obsidian-wikilink-types) to add typed relationships to your notes before importing. The plugin syncs typed wikilinks (`[[Note|display @supports]]`) to YAML frontmatter, which this tool reads and sends to Penfield as graph relationships. No relationships? No problem - the tool imports everything without them.
+For the richest vault import, use [obsidian-wikilink-types](https://github.com/penfieldlabs/obsidian-wikilink-types) to add typed relationships to your notes before importing. The plugin syncs typed wikilinks (`[[Note|display @supports]]`) to YAML frontmatter, which this tool reads and sends to Penfield as graph relationships. No relationships? No problem - the tool imports everything without them.
 
-## How it works
+## ZIP import (Penfield portal exports)
+
+The tool auto-detects `.zip` files and processes them as Penfield portal exports.
+
+```bash
+# Preview what's in the export
+penfield-import /path/to/export.zip --dry-run
+
+# Run the import
+penfield-import /path/to/export.zip
+
+# Specify a checkpoint directory
+penfield-import /path/to/export.zip --checkpoint-dir /tmp/import-state
+```
+
+### How ZIP import works
+
+The tool validates the manifest, then processes five phases in the order mandated by the export spec:
+
+1. **Memories** — Creates memories from `memories.jsonl`. Passes through `memory_type`, `importance`, `confidence`, `source_type`, `metadata`, and `tags`. Skips `identity_core` (API does not allow creation). Downgrades `personality_trait` to `fact`.
+2. **Relationships** — Remaps source/target IDs to the new tenant's IDs, then bulk-creates relationships in batches of 100 with individual fallback on batch failure.
+3. **Contexts** — Recreates saved contexts as `checkpoint` memories via the memories API, remapping all memory references. Handles 409 conflict (duplicate checkpoint name) gracefully.
+4. **Artifacts** — Extracts text artifacts from the ZIP and uploads them. Binary files (detected via null bytes) are skipped. Validates path format (no spaces or special chars) and enforces the 1 MB size limit.
+5. **Documents** — Extracts document files and uploads them via multipart form with metadata.
+
+Each record is checkpointed individually. Resume by re-running the same command.
+
+### Fields not preserved on round-trip
+
+The following fields are present in the export for archival purposes but cannot be set via the public API: `surprise_score`, `user_id`, `is_evolution`, `evolution_id`, `evolution_type`, `parent_memory_id`, `lifecycle_state`, `created_at`, `updated_at` (memories); `is_auto_detected` (relationships); `tags` (documents).
+
+## Vault import (Obsidian / markdown)
+
+### How vault import works
 
 The tool runs in seven phases, checkpointing after each for crash safety:
 
@@ -36,11 +72,13 @@ This installs the `penfield-import` command. All examples below use it. If you p
 # Authenticate with Penfield (one-time, opens browser)
 penfield-import --login
 
-# Preview what will be imported
-penfield-import /path/to/notes --dry-run
+# Import a Penfield portal export ZIP
+penfield-import /path/to/export.zip --dry-run   # preview
+penfield-import /path/to/export.zip              # run
 
-# Run the import
-penfield-import /path/to/notes
+# Import an Obsidian vault or markdown directory
+penfield-import /path/to/notes --dry-run         # preview
+penfield-import /path/to/notes                   # run
 
 # Check version
 penfield-import --version
@@ -117,7 +155,7 @@ If note bodies contain stale metadata blocks from prior import/export cycles (e.
 The `type:` field in frontmatter is mapped directly to Penfield's `memory_type`. Three types get special treatment:
 
 - **`type: identity_core`** — skipped entirely. Identity core memories are managed by Penfield's personality system and cannot be created via the memories API.
-- **`type: personality_trait`** — imported as `fact` with an `[Imported personality_trait note]` prefix. Personality traits are also managed by the personality system; this is the closest equivalent that the memories API accepts.
+- **`type: personality_trait`** — imported as `fact` with an `[Imported personality_trait]` prefix. Personality traits are also managed by the personality system; this is the closest equivalent that the memories API accepts.
 - **`type: checkpoint`** — imported as `reference`. The `checkpoint` memory type is the persistence layer for MCP cognitive handoffs created by [`save_context`](https://penfield.app/docs/mcp/mcp-integration.md#save_context); each record stores a JSON `{"checkpoint_name", "description", "memory_ids"}` blob that `restore_context` and `list_contexts` parse at read time. There is no public API path that reproduces that JSON shape — the only legitimate way to create a checkpoint is through `save_context` itself. A checkpoint note in an exported vault has had its JSON unwrapped into a plain description and `references:` wikilinks during export, so re-importing it as a checkpoint would produce a malformed record that is no longer restorable. Downgrading to `reference` preserves its content and `references:` relationships as an ordinary summary memory that is still discoverable via search and graph traversal.
 
 All other frontmatter types (`fact`, `insight`, `conversation`, `correction`, `reference`, `task`, `strategy`, `relationship`) are passed through to Penfield as-is.
@@ -216,14 +254,14 @@ Artifacts are not searchable — that's why every oversized note also gets a mem
 ## CLI reference
 
 ```
-python penfield_import.py [vault_path] [options]
+penfield-import [INPUT_PATH] [options]
 ```
 
 ### Import options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `vault_path` | *(required for import)* | Path to directory of .md/.txt files |
+| `INPUT_PATH` | *(required for import)* | Path to a Penfield export `.zip` file or a directory of `.md`/`.txt` files |
 | `--base-url` | `https://api.penfield.app` | Penfield API base URL |
 | `--checkpoint-dir` | vault path | Where checkpoint/report files go |
 | `--llm` | off | Enable LLM summarization (OpenAI-compatible API) |
@@ -257,12 +295,13 @@ python penfield_import.py [vault_path] [options]
 
 ## Checkpoint and crash recovery
 
-The tool writes a checkpoint file (`.penfield_import_checkpoint.json`) after each individual operation. If the import is interrupted, re-run the same command and it picks up where it left off.
+The tool writes a checkpoint file after each individual operation. If the import is interrupted, re-run the same command and it picks up where it left off.
 
+- Vault imports use `.penfield_import_checkpoint.json`
+- ZIP imports use `.penfield_zip_import_checkpoint.json`
 - Checkpoint is written atomically (write to `.tmp`, then `os.replace()`)
 - Use `--reset` to delete the checkpoint and start fresh
 - Use `--checkpoint-dir` to store the checkpoint somewhere other than the source directory
-- `.penfield_import_checkpoint.json` and `.penfield_import_report.txt` are included in the project's `.gitignore`
 
 ### Incremental import (git vaults)
 
@@ -287,7 +326,7 @@ python penfield_import.py /path/to/vault
 - Directories named `_meta`, `_templates`, `_penfield`, `_config`, `Artifacts`, and `Documents` are skipped by default (configurable with `--skip-dirs`). `Artifacts/` and `Documents/` have their own dedicated import phases and should not be processed as memories.
 - No specific directory structure is required - works with any folder layout
 - Files are identified by their relative path (e.g., `concepts/trust.md`), so duplicate filenames in different directories are stored as separate memories
-- **Duplicate filename caveat:** Relationship targets in frontmatter use note names without paths (e.g., `[[trust]]`). If multiple files share the same filename in different directories, relationships targeting that name resolve to one arbitrarily. The tool warns when this happens. For best results, use unique filenames
+- **Duplicate filename caveat:** Relationship targets in frontmatter use note names without paths (e.g., `[[trust]]`). If multiple files share the same filename in different directories, relationships targeting that name are skipped with a warning (the target is ambiguous). For best results, use unique filenames
 
 ### Supported layouts
 
