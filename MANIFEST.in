@@ -1,1 +1,3 @@
 recursive-include tests *.py
+include tools/reset_dev_content.py
+include tools/verify_restore.py

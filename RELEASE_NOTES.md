@@ -16,6 +16,10 @@ The candidate refuses automatic reuse of older, unbound ledgers. An existing 2.0
 
 At write time, the client reads back accepted memories and edges, compares text artifacts and checks original document bytes. Processing and embedding completion are separate from byte verification. Service-managed fields, protected memory types and binary artifacts have the preservation limits described in the README. A no-op resume relies on the saved receipts.
 
+Context verification checks the name and member count in the checkpoint content and preserves caller-supplied checkpoint metadata. Document downloads use the same client identity header as uploads. The report checks chunk-level embedding progress, retains pending outcomes for a later status refresh, and identifies document tags the API cannot store.
+
+The source distribution includes the dev-only content reset helper. It inventories inactive memories, relationships, documents and recursive artifact paths. After an authorized reset it checks each original ID or path for HTTP 404 and enumerates the destination again. Usage and required scopes appear in the README.
+
 ## External review before merge
 
 Exercise the installed wheel against disposable dev destination state. Include a rejected write followed by retry, an occupied artifact path with different content, a malformed late record, the same archive with a second destination, nested contexts, document download, duplicate context names and OAuth account rotation. Verify fixture cleanup by ID. Keep private exports, credentials and local reconciliation logs outside the repository.

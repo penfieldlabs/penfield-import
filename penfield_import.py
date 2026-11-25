@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 import tempfile
+import unicodedata
 import urllib.parse
 from email.utils import parsedate_to_datetime
 import urllib.error
@@ -34,6 +35,7 @@ import urllib.request
 from penfield_io import checkpoint_lock, open_request, origin, write_json_atomic
 from collections import deque
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -237,6 +239,27 @@ class ParsedNote:
     _formatted_length: int = -1           # cached length of formatted content (-1 = not computed)
 
 
+_pending_receipt = ContextVar("pending_receipt", default=None)
+
+
+@contextmanager
+def _track_acknowledgement(intent, checkpoint, path):
+    """Make server-returned locators durable before starting independent reads."""
+    token = _pending_receipt.set((intent, checkpoint, path))
+    try:
+        yield
+    finally:
+        _pending_receipt.reset(token)
+
+
+def _acknowledge(collection: str, keys: list[str]) -> None:
+    active = _pending_receipt.get()
+    if active is not None and keys:
+        intent, checkpoint, path = active
+        intent["acknowledgement"] = {"collection": collection, "keys": keys}
+        checkpoint.save(path)
+
+
 @dataclass
 class Checkpoint:
     """Import checkpoint for crash recovery and incremental imports.
@@ -335,7 +358,8 @@ class Checkpoint:
         self.pending_write = {"kind": kind, "keys": keys}
         self.save(path)
         try:
-            yield
+            with _track_acknowledgement(self.pending_write, self, path):
+                yield
         except APIError as exc:
             if exc.status_code in (0, 408) or exc.status_code >= 500:
                 raise ValueError(f"Uncertain {kind} write for {keys!r}. "
@@ -345,6 +369,9 @@ class Checkpoint:
         else:
             # Saved atomically with the receipt by the caller.
             self.pending_write = None
+
+    def document_index_state(self, key: str) -> str:
+        return _index_state(self.document_processing.get(key), self.document_embedding_progress.get(key))
 
     def record_processing(self, key: str, receipt: dict[str, Any]) -> None:
         self.document_processing[key] = _processing_status(receipt)
@@ -400,6 +427,26 @@ def _git_new_files_since(vault_path: Path, since_sha: str) -> list[str]:
     return [p.as_posix() for p in paths if p.suffix.lower() in exts or p.parts[0] in {"Documents", "Artifacts"}]
 
 
+def _are_committed_additions(vault_path: Path, new_paths: set[str], git_paths: set[str]) -> bool:
+    """Git on macOS can store a different Unicode spelling from readdir()."""
+    unmatched = new_paths - git_paths
+    if not unmatched:
+        return True
+    candidates: dict[str, list[str]] = {}
+    for path in git_paths - new_paths:
+        candidates.setdefault(unicodedata.normalize("NFC", path), []).append(path)
+    for path in unmatched:
+        choices = candidates.pop(unicodedata.normalize("NFC", path), [])
+        if len(choices) != 1:
+            return False
+        try:
+            if not (vault_path / path).samefile(vault_path / choices[0]):
+                return False
+        except FileNotFoundError:
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Rate limiter
 # ---------------------------------------------------------------------------
@@ -438,7 +485,8 @@ class RateLimiter:
 # ---------------------------------------------------------------------------
 
 def normalize_tag(tag: str) -> str:
-    return re.sub(r"[^a-z0-9-]", "", tag.lower().replace(" ", "-").replace("_", "-"))
+    allowed = re.sub(r"[^a-z0-9-]", "", tag.lower().replace(" ", "-").replace("_", "-"))
+    return re.sub(r"-{2,}", "-", allowed)
 
 
 def _retry_delay(value: Optional[str], attempt: int) -> float:
@@ -710,6 +758,7 @@ class PenfieldClient:
             raise APIError(422, "Memory exceeds tag limit", "/memories")
         resp = self.request("POST", "/memories", payload)
         memory_id = self._receipt_id(resp.get("data"), "/memories")
+        _acknowledge("memories", [memory_id])
         path = "/memories/" + urllib.parse.quote(memory_id, safe="")
         stored = self._readback(path)
         for field, wanted in payload.items():
@@ -745,6 +794,7 @@ class PenfieldClient:
         existing = False
         try:
             self.request("POST", "/artifacts", {"path": path, "content": content})
+            _acknowledge("artifacts", [path])
         except APIError as exc:
             if exc.status_code != 409:
                 raise
@@ -806,12 +856,18 @@ class PenfieldClient:
                     result = json.loads(resp.read().decode())
                     receipt = result.get("data", result)
                 doc_id = self._receipt_id({"id": receipt.get("id") or receipt.get("document_id")}, "/documents/upload")
+                _acknowledge("documents", [doc_id])
                 path = "/documents/" + urllib.parse.quote(doc_id, safe="")
                 stored = self._readback(path)
                 media_type = stored.get("content_type") or stored.get("mime_type")
+                stored_metadata = stored.get("metadata")
+                metadata_matches = not metadata or (
+                    isinstance(stored_metadata, dict)
+                    and all(k in stored_metadata and stored_metadata[k] == v for k, v in metadata.items())
+                )
                 if (stored.get("id") != doc_id or stored.get("filename") != filename
-                        or (content_type != "application/octet-stream" and media_type != content_type) or
-                        any((stored.get("metadata") or {}).get(k) != v for k, v in (metadata or {}).items())):
+                        or (content_type != "application/octet-stream" and media_type != content_type)
+                        or not metadata_matches):
                     raise APIError(0, "Document metadata readback mismatch", path)
                 self._verify_document_bytes(path, data)
                 return dict(receipt, id=doc_id, processing_status=stored.get("processing_status"),
@@ -844,12 +900,17 @@ class PenfieldClient:
         self._rate_limiter.wait()
         req = urllib.request.Request(
             self._base_url + path + "/download",
-            headers={"Authorization": f"Bearer {self._access_token}"},
+            headers={"Authorization": f"Bearer {self._access_token}",
+                     "User-Agent": f"penfield-import/{__version__}"},
         )
         try:
             with open_request(req, timeout=120) as resp:
                 if resp.read(len(expected) + 1) != expected:
                     raise APIError(0, "Document bytes differ", path)
+        except urllib.error.HTTPError as exc:
+            error = APIError.from_http(exc, path)
+            raise APIError(0, f"Document download returned HTTP {exc.code}", path,
+                           request_id=error.request_id) from exc
         except OSError as exc:
             raise APIError(0, "Document bytes unavailable", path) from exc
 
@@ -879,6 +940,9 @@ class PenfieldClient:
             raise APIError(412, "Existing relationship differs", "/relationships/bulk") from exc
         data = reply.get("data", {})
         created = data.get("created")
+        if isinstance(created, list):
+            _acknowledge("relationships", [row["id"] for row in created if isinstance(row, dict)
+                                           and isinstance(row.get("id"), str) and row["id"].strip()])
         if not isinstance(created, list) or len(created) < len(relationships) or data.get("errors"):
             raise APIError(0, "Incomplete bulk receipt", "/relationships/bulk")
         extras = []
@@ -1510,7 +1574,7 @@ def run_artifacts_phase(
 DOCUMENT_EXTENSIONS = frozenset({
     ".txt", ".md", ".pdf", ".epub",
     ".json", ".yaml", ".yml",
-    ".py", ".js", ".csv", ".xml",
+    ".py", ".js", ".ts", ".csv", ".xml",
     ".html", ".htm",
 })
 
@@ -1606,6 +1670,30 @@ def _processing_status(receipt: dict[str, Any]) -> str:
     return value.strip().lower() if isinstance(value, str) and value.strip() else "unknown"
 
 
+def _index_state(status: Optional[str], progress: Any) -> str:
+    """Processing of bytes and generation of chunk vectors can finish separately."""
+    if status in _INDEXING_FAILED:
+        return "failed"
+    if isinstance(progress, dict):
+        # The real API reports counters for individual chunks; a top-level
+        # document status such as "active" can outlive the indexing work.
+        failed = progress.get("failed")
+        if type(failed) is int and failed > 0:
+            return "failed"
+        total, completed, pending = (progress.get(k) for k in ("total", "completed", "pending"))
+        if not all(type(n) is int and n >= 0 for n in (total, completed, pending, failed)):
+            return "unknown"
+        if pending or completed < total:
+            return "pending"
+        if completed > total:
+            return "unknown"
+        if total:
+            return "ready"
+    if status in _INDEXING_DONE:
+        return "ready"
+    return "pending" if status in {"active", "uploading", "processing", "pending", "queued"} else "unknown"
+
+
 def _document_files(documents_dir: Path) -> list[Path]:
     return [p for p in _vault_files(documents_dir)
             if p.suffix.lower() in DOCUMENT_EXTENSIONS and p != documents_dir / "documents.json"]
@@ -1640,7 +1728,7 @@ def run_documents_phase(
         if doc_key in checkpoint.documents:
             receipt = checkpoint.documents[doc_key]
             if (not receipt.startswith(SKIP_SENTINEL_PREFIX)
-                    and checkpoint.document_processing.get(doc_key) not in _INDEXING_DONE):
+                    and checkpoint.document_index_state(doc_key) != "ready"):
                 checkpoint.record_processing(doc_key, client.document_status(receipt))
                 checkpoint.save(checkpoint_path)
             continue
@@ -1669,7 +1757,10 @@ def run_documents_phase(
             raise ValueError(f"Document changed since preflight: {source_key}")
         try:
             with checkpoint.writing(checkpoint_path, "document", [doc_key]):
-                mime = mimetypes.guess_type(filepath.name)[0] or "application/octet-stream"
+                # MIME databases commonly map .ts to video/mp2t. The document API
+                # accepts TypeScript source as code, so send a text media type.
+                mime = ("text/plain" if filepath.suffix.lower() == ".ts"
+                        else mimetypes.guess_type(filepath.name)[0] or "application/octet-stream")
                 result = client.upload_document_bytes(filepath.name, data, content_type=mime,
                                                      metadata={"vault_path": doc_key})
                 doc_id = result.get("id") or result.get("document_id")
@@ -1700,7 +1791,7 @@ def build_relationship_list(
     for relpath in paths:
         path = Path(relpath)
         for alias in {path.stem, path.as_posix(), path.with_suffix("").as_posix()}:
-            candidates.setdefault(alias, set()).add(relpath)
+            candidates.setdefault(unicodedata.normalize("NFC", alias), set()).add(relpath)
     for name, choices in sorted(candidates.items()):
         if len(choices) > 1:
             logger.warning("Duplicate filename '%s' is ambiguous: %s", name, ", ".join(sorted(choices)))
@@ -1711,7 +1802,7 @@ def build_relationship_list(
         k: v for k, v in checkpoint.memories.items()
         if v and not v.startswith(SKIP_SENTINEL_PREFIX)
     }
-    result: list[tuple[str, dict[str, Any]]] = []
+    result: dict[str, dict[str, Any]] = {}
 
     for note in notes:
         from_id = memory_lookup.get(note.rel_path)
@@ -1720,7 +1811,7 @@ def build_relationship_list(
 
         for target_filename, rel_type in note.relationships:
             target = target_filename.split("#", 1)[0] or note.rel_path
-            options = candidates.get(target, set())
+            options = candidates.get(unicodedata.normalize("NFC", target), set())
             target_relpath = next(iter(options)) if len(options) == 1 else None
             to_id = memory_lookup.get(target_relpath) if target_relpath else None
             if not to_id:
@@ -1730,13 +1821,13 @@ def build_relationship_list(
                 continue
 
             dedup_key = f"{note.rel_path}|{target_relpath}|{rel_type}"
-            result.append((dedup_key, {
+            result[dedup_key] = {
                 "from_id": from_id,
                 "to_id": to_id,
                 "relationship_type": rel_type,
-            }))
+            }
 
-    return result
+    return list(result.items())
 
 
 def _create_relationships_individually(
@@ -1807,7 +1898,7 @@ def run_relationships_phase(
             ]
             checkpoint.save(checkpoint_path)
         except APIError as e:
-            if e.status_code == 409:
+            if len(batch) > 1 and e.status_code in (400, 409, 422):
                 logger.warning(
                     "Batch %d/%d returned %d, falling back to individual creates",
                     batch_idx + 1, len(batches), e.status_code,
@@ -2000,6 +2091,7 @@ class ZipCheckpoint:
     identical_artifacts: list[str] = field(default_factory=list)
     identical_relationships: list[str] = field(default_factory=list)
     document_processing: dict[str, dict[str, Any]] = field(default_factory=dict)
+    document_tag_omissions: dict[str, list[str]] = field(default_factory=dict)
     artifact_mime_mismatches: dict[str, str] = field(default_factory=dict)
     relationship_id_map: dict[str, str] = field(default_factory=dict)
     skipped_relationships: dict[str, str] = field(default_factory=dict)
@@ -2031,7 +2123,9 @@ class ZipCheckpoint:
                 raise ValueError(f"Invalid ZIP checkpoint field: {key}")
             elif isinstance(default, list) and not all(isinstance(v, str) for v in value):
                 raise ValueError(f"Invalid ZIP checkpoint list: {key}")
-            elif isinstance(default, dict) and key not in {"context_unresolved", "in_flight", "document_processing"}:
+            elif isinstance(default, dict) and key not in {
+                "context_unresolved", "in_flight", "document_processing", "document_tag_omissions",
+            }:
                 if not all(isinstance(v, str) and v for v in value.values()):
                     raise ValueError(f"Invalid ZIP checkpoint mapping: {key}")
             setattr(checkpoint, key, value)
@@ -2043,6 +2137,9 @@ class ZipCheckpoint:
         if any(not isinstance(ids, list) or any(not isinstance(mid, str) for mid in ids)
                for ids in checkpoint.context_unresolved.values()):
             raise ValueError("Invalid ZIP checkpoint unresolved context membership")
+        if any(not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags)
+               for tags in checkpoint.document_tag_omissions.values()):
+            raise ValueError("Invalid ZIP checkpoint document tag omissions")
         return checkpoint
 
     def validate_source_keys(self, keys: dict[str, set[str]]) -> None:
@@ -2061,6 +2158,7 @@ class ZipCheckpoint:
             if not seen <= keys[section]:
                 raise ValueError(f"Checkpoint contains unknown {section} keys")
         if not (self.document_processing.keys() <= self.documents.keys()
+                and self.document_tag_omissions.keys() <= keys["documents"]
                 and self.artifact_mime_mismatches.keys() <= self.artifacts.keys()
                 and set(self.identical_artifacts) <= self.artifacts.keys()
                 and set(self.identical_relationships) <= self.relationships_done
@@ -2470,8 +2568,6 @@ def run_zip_contexts_phase(
             logger.error("Context %r exceeds the memory content limit", name)
             record_failure(key, unresolved)
             return
-        metadata = dict(rec.get("checkpoint_metadata") or {})
-        metadata.update(checkpoint_name=name, memory_count=len(members))
         tags = ["context", "checkpoint"]
         name_tag = normalize_tag(name)
         if 1 <= len(name_tag) <= 50 and name_tag not in tags:
@@ -2480,7 +2576,7 @@ def run_zip_contexts_phase(
         try:
             new_id = client.create_memory(
                 content=context_content, memory_type="checkpoint", importance=0.9,
-                tags=tags, metadata=metadata,
+                tags=tags, metadata=rec.get("checkpoint_metadata") or None,
             )
         except APIError as exc:
             if exc.status_code == 0 or exc.status_code >= 500:
@@ -2609,7 +2705,7 @@ def _record_zip_document_status(checkpoint: ZipCheckpoint, key: str, receipt: di
     checkpoint.document_processing[key] = {
         "processing_status": state, "embedding_progress": receipt.get("embedding_progress"),
     }
-    if state in _INDEXING_FAILED:
+    if _index_state(state, receipt.get("embedding_progress")) == "failed":
         if key not in checkpoint.failed_documents:
             checkpoint.failed_documents.append(key)
     elif key in checkpoint.failed_documents:
@@ -2631,7 +2727,7 @@ def run_zip_documents_phase(
             destination_id = checkpoint.documents[source_id]
             previous = checkpoint.document_processing.get(source_id, {})
             if (not destination_id.startswith(SKIP_SENTINEL_PREFIX)
-                    and previous.get("processing_status") not in _INDEXING_DONE):
+                    and _index_state(previous.get("processing_status"), previous.get("embedding_progress")) != "ready"):
                 _record_zip_document_status(checkpoint, source_id, client.document_status(destination_id))
                 checkpoint.save(checkpoint_path)
             continue
@@ -2724,6 +2820,9 @@ def run_zip_verify_phase(
                             and not checkpoint.contexts[key].startswith(SKIP_SENTINEL_PREFIX)}
         elif section == "artifacts":
             partial_keys = set(checkpoint.artifact_mime_mismatches)
+        elif section == "documents":
+            partial_keys = {key for key in checkpoint.document_tag_omissions if key in checkpoint.documents
+                            and not checkpoint.documents[key].startswith(SKIP_SENTINEL_PREFIX)}
         identical = len(set(getattr(checkpoint, "identical_" + section, ())) - partial_keys)
         partial = len(partial_keys)
         print(f"{section.upper()}: {accepted - identical - partial} restored, {identical} identical, "
@@ -2733,17 +2832,28 @@ def run_zip_verify_phase(
     if checkpoint.artifact_mime_mismatches:
         print(f"Artifacts with a different destination content type: {len(checkpoint.artifact_mime_mismatches)}")
         complete = False
+    if checkpoint.document_tag_omissions:
+        print(f"Documents with source tags the API cannot restore: {len(checkpoint.document_tag_omissions)}")
+        complete = False
+    awaiting_index = 0
     if checkpoint.document_processing:
         statuses = {}
         for receipt in checkpoint.document_processing.values():
-            status = receipt["processing_status"]
-            statuses[status] = statuses.get(status, 0) + 1
-        print(f"Document processing statuses: {statuses}")
+            state = _index_state(receipt["processing_status"], receipt.get("embedding_progress"))
+            statuses[state] = statuses.get(state, 0) + 1
+        awaiting_index = statuses.get("pending", 0) + statuses.get("unknown", 0)
+        if statuses.get("failed"):
+            complete = False
+        print(f"Document indexing: {statuses}")
     if checkpoint.context_unresolved:
         count = sum(len(ids) for ids in checkpoint.context_unresolved.values())
         print(f"Unresolved context memberships: {count}")
         complete = False
-    print("Restore complete." if complete else "Incomplete restore. See checkpoint for affected source keys.")
+    if complete and awaiting_index:
+        print(f"Source data restored. Indexing is pending or unconfirmed for {awaiting_index} document(s). "
+              "Rerun to refresh their status.")
+    else:
+        print("Restore complete." if complete else "Incomplete restore. See checkpoint for affected source keys.")
     return complete
 
 
@@ -2766,7 +2876,8 @@ class _JournaledZipClient:
                                          "source_keys": self.checkpoint.write_keys}
             self.checkpoint.save(self.path)
             try:
-                result = method(*args, **kwargs)
+                with _track_acknowledgement(self.checkpoint.in_flight, self.checkpoint, self.path):
+                    result = method(*args, **kwargs)
             except APIError as exc:
                 if exc.status_code == 0 or exc.status_code == 408 or exc.status_code >= 500:
                     raise ValueError(f"Uncertain outcome for {self.checkpoint.in_flight}; "
@@ -2863,6 +2974,9 @@ def run_zip_import(
                 if not isinstance(destination, str) or not destination:
                     raise ValueError("Cannot establish destination identity")
                 checkpoint = ZipCheckpoint() if reset else ZipCheckpoint.load(checkpoint_path)
+                # Derive omissions from this archive, including on resume from an older receipt.
+                checkpoint.document_tag_omissions = {row["id"]: row["tags"] for _, row in _zip_records(zf, "documents")
+                                                     if row.get("tags")}
                 if checkpoint_path.exists() and not reset:
                     if checkpoint.source_sha256 != source or checkpoint.destination != destination:
                         raise ValueError("Checkpoint is unbound or belongs to another archive or destination. "
@@ -2877,7 +2991,7 @@ def run_zip_import(
                                          "before resuming. Retain this checkpoint.")
                     if checkpoint.phase == "done":
                         print("Checking saved write-time receipts for this destination.")
-                        settled = all(r["processing_status"] in _INDEXING_DONE
+                        settled = all(_index_state(r["processing_status"], r.get("embedding_progress")) == "ready"
                                       for r in checkpoint.document_processing.values())
                         if settled and run_zip_verify_phase(client, checkpoint, manifest):
                             return 0
@@ -3061,10 +3175,10 @@ def write_import_report(
     doc_uploaded = sum(1 for v in checkpoint.documents.values() if not v.startswith(SKIP_SENTINEL_PREFIX))
     doc_skipped = sum(1 for v in checkpoint.documents.values() if v.startswith(SKIP_SENTINEL_PREFIX))
     doc_failed = len(checkpoint.failed_documents)
-    index_failures = {name: status for name, status in checkpoint.document_processing.items()
-                      if status in _INDEXING_FAILED}
+    index_states = {key: checkpoint.document_index_state(key) for key in checkpoint.document_processing}
+    index_failures = {name: state for name, state in index_states.items() if state == "failed"}
     indexing_counts: dict[str, int] = {}
-    for status in checkpoint.document_processing.values():
+    for status in index_states.values():
         indexing_counts[status] = indexing_counts.get(status, 0) + 1
 
     rel_created = len(checkpoint.relationships_done)
@@ -3095,7 +3209,7 @@ def write_import_report(
         f"  Uploaded:     {doc_uploaded}",
         f"  Skipped:      {doc_skipped} (unsafe)",
         f"  Failed:       {doc_failed}",
-        "  Processing:   " + (", ".join(f"{k}={v}" for k, v in sorted(indexing_counts.items())) or "none"),
+        "  Indexing:     " + (", ".join(f"{k}={v}" for k, v in sorted(indexing_counts.items())) or "none"),
         *(f"  {name}: {status}" for name, status in index_failures.items()),
         *(f"  Embedding progress for {name}: {progress}" for name, progress
           in checkpoint.document_embedding_progress.items() if progress is not None),
@@ -3425,13 +3539,13 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
                 added = set(_git_new_files_since(vault_path, checkpoint.commit_sha))
                 changed = {key for key, digest in checkpoint.source_hashes.items() if hashes.get(key) != digest}
                 new = hashes.keys() - checkpoint.source_hashes.keys()
-                if changed or not new.issubset(added):
+                if changed or not _are_committed_additions(vault_path, new, added):
                     raise ValueError("Completed vault changed beyond committed additions. "
                                      "Reconcile the source and destination before another import.")
             elif checkpoint.phase == "done":
                 if not receipts_complete(checkpoint):
                     raise ValueError("Completed checkpoint has missing or unexpected receipts; reconcile before resuming")
-                if all(status in _INDEXING_DONE for status in checkpoint.document_processing.values()):
+                if all(checkpoint.document_index_state(key) == "ready" for key in checkpoint.documents):
                     logger.info("Vault already imported for this destination and snapshot.")
                     return 0
 
@@ -3453,7 +3567,7 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
                             args.llm or args.claude, verification_ok=verified)
         failed = (checkpoint.failed_memories or checkpoint.failed_artifacts or checkpoint.failed_vault_artifacts
                   or checkpoint.failed_documents or checkpoint.failed_relationships or checkpoint.unresolved_links)
-        indexing_failed = any(value in _INDEXING_FAILED for value in checkpoint.document_processing.values())
+        indexing_failed = any(checkpoint.document_index_state(key) == "failed" for key in checkpoint.documents)
         if failed or not verified or indexing_failed:
             checkpoint.phase = "memories"
             checkpoint.save(checkpoint_path)
@@ -3470,7 +3584,12 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
     elif isinstance(summarizer, ClaudeClient) and summarizer.total_notes_summarized:
         print(f"\nClaude summarized {summarizer.total_notes_summarized} oversized note(s)")
 
-    logger.info("Import complete!")
+    awaiting_index = sum(checkpoint.document_index_state(key) != "ready" for key in checkpoint.documents)
+    if awaiting_index:
+        logger.info("Source data restored. Indexing pending or unconfirmed for %d document(s); "
+                    "rerun to refresh their status.", awaiting_index)
+    else:
+        logger.info("Import complete!")
     return 0
 
 

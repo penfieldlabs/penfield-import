@@ -156,6 +156,7 @@ def test_multipart_uses_wire_bytes_and_independent_download(monkeypatch):
                 "processing_status": "pending",
             }}).encode())
         assert path == "/documents/doc-1/download"
+        assert req.get_header("User-agent") == f"penfield-import/{imp.__version__}"
         return BytesIO(blob)
 
     monkeypatch.setattr(imp, "open_request", serve)
@@ -177,6 +178,16 @@ def test_wrong_document_bytes_leave_unknown_outcome(monkeypatch):
     with pytest.raises(imp.APIError) as exc:
         api.upload_document_bytes("original.txt", b"new")
     assert exc.value.status_code == 0
+
+
+def test_null_valued_document_metadata_key_must_survive(monkeypatch):
+    from io import BytesIO
+    api = client()
+    replies = [b'{"data":{"id":"d"}}', b'{"data":{"id":"d","filename":"file.txt","metadata":{}}}']
+    monkeypatch.setattr(imp, "open_request", lambda *args, **kwargs: BytesIO(replies.pop(0)))
+    with pytest.raises(imp.APIError) as exc:
+        api.upload_document_bytes("file.txt", b"data", metadata={"key": None})
+    assert exc.value.body == "Document metadata readback mismatch"
     assert not replies
 
 

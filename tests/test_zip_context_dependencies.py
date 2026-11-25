@@ -38,7 +38,7 @@ def test_forward_context_dependency_and_partial_membership_survive_resume(tmp_pa
     assert api.create_memory.call_count == 2
     first, second = [call.kwargs for call in api.create_memory.call_args_list]
     assert json.loads(first["content"])["memory_ids"] == [destination_id]
-    assert first["metadata"]["category"] == "audit"
+    assert first["metadata"] == {"category": "audit"}
     child_payload = json.loads(second["content"])
     assert child_payload["memory_ids"] == ["new-parent", destination_id]
     assert child_payload["description"] == f"see memory_id: {destination_id}"
@@ -82,6 +82,7 @@ def test_retryable_source_memory_failure_defers_context(tmp_path):
     ("Résumé: A_B", ["context", "checkpoint", "rsum-a-b"]),
     ("x" * 51, ["context", "checkpoint"]),
     ("Context", ["context", "checkpoint"]),
+    ("Example - 2026", ["context", "checkpoint", "example-2026"]),
 ])
 def test_context_name_remains_exact_when_derived_tag_is_normalized_or_omitted(tmp_path, name, expected):
     cp = importer.ZipCheckpoint()
@@ -92,7 +93,7 @@ def test_context_name_remains_exact_when_derived_tag_is_normalized_or_omitted(tm
     payload = api.create_memory.call_args.kwargs
     assert payload["tags"] == expected
     assert json.loads(payload["content"])["checkpoint_name"] == name
-    assert payload["metadata"]["checkpoint_name"] == name
+    assert payload["metadata"] is None
 
 
 @pytest.mark.parametrize("receipt", [{}, {"id": None}, {"id": ""}])
@@ -146,3 +147,42 @@ def test_failed_document_processing_refreshes_status_without_uploading_again(tmp
     api.upload_document_bytes.assert_called_once()
     api.document_status.assert_called_once_with("stored")
     assert cp.document_processing["d"] == {"processing_status": "ready", "embedding_progress": 1.0}
+
+
+@pytest.mark.parametrize("changed_field", [None, "metadata", "checkpoint_name", "memory_count"])
+def test_context_readback_checks_source_metadata_and_serialized_name_and_count(tmp_path, changed_field):
+    source_metadata = {"fixture": "source", "checkpoint_name": "independent source value", "memory_count": 99}
+    record = context("ctx", [], name="restored name", checkpoint_metadata=source_metadata)
+    received = {}
+    api = importer.PenfieldClient(access_token="offline-test-token")
+
+    def request(method, path, body=None):
+        if method == "POST":
+            assert path == "/memories"
+            assert body["metadata"] == source_metadata
+            received.update(body)
+            content = json.loads(body["content"])
+            assert (content["checkpoint_name"], content["memory_count"]) == ("restored name", 0)
+            return {"data": {"id": "destination"}}
+        assert (method, path) == ("GET", "/memories/destination")
+        stored = dict(received, id="destination")
+        if changed_field == "metadata":
+            stored["metadata"] = {"fixture": "source"}
+        elif changed_field:
+            content = json.loads(stored["content"])
+            content[changed_field] = "changed"
+            stored["content"] = json.dumps(content)
+        return {"data": stored}
+
+    api.request = request
+    cp = importer.ZipCheckpoint()
+    with make_zip(contexts=[record]) as archive:
+        if changed_field:
+            with pytest.raises(importer.APIError) as error:
+                importer.run_zip_contexts_phase(archive, api, cp, tmp_path / "cp")
+            assert error.value.status_code == 0
+            assert "readback differs" in error.value.body
+            assert "ctx" not in cp.contexts
+        else:
+            importer.run_zip_contexts_phase(archive, api, cp, tmp_path / "cp")
+            assert cp.contexts == {"ctx": "destination"}

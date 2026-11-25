@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix vault parsing, incremental discovery, duplicate note names and oversized note preservation.
 - Honor the destination environment setting, isolate cached grants, verify refreshed credentials and restrict credentialed redirects.
 - Fix the build backend requirement and source distribution test collection.
+- Add a standalone dev content reset tool with recursive artifact discovery, paginated inventories, tenant verification and post-delete checks.
+- Preserve returned destination IDs during write verification. Verify context metadata and original document downloads, report omitted document tags, and distinguish pending or failed vectors from verified bytes.
 
 ## [2.0.0] - 2026-06-03
 

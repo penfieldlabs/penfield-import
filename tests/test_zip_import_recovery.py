@@ -104,6 +104,32 @@ def test_checkpoint_is_bound_to_archive_and_destination(tmp_path):
     assert api.create_memory.call_count == 1
 
 
+def test_acknowledged_memory_id_persisted_before_readback(tmp_path):
+    archive = export(tmp_path, memories=[{"id": "source", "content": "original"}])
+    api = importer.PenfieldClient("https://example.com", access_token="test")
+    api.destination_identity = Mock(return_value="target")
+    api.request = Mock(side_effect=[{"data": {"id": "destination"}}, importer.APIError(503, "", "/memories/destination")])
+    assert importer.run_zip_import(archive, api) == 1
+    path = tmp_path / importer.ZIP_CHECKPOINT_FILENAME
+    state = importer.ZipCheckpoint.load(path)
+    assert state.in_flight["acknowledgement"] == {"collection": "memories", "keys": ["destination"]}
+    assert state.memory_id_map == {}
+    assert importer.run_zip_import(archive, api) == 1
+    assert api.request.call_count == 2
+
+
+def test_vault_keeps_acknowledged_ids_after_interrupted_readback(tmp_path):
+    checkpoint = importer.Checkpoint()
+    state = tmp_path / "checkpoint.json"
+    api = importer.PenfieldClient("https://example.com", access_token="test")
+    api.request = Mock(side_effect=[{"data": {"created": [{"id": "edge"}]}}, OSError("interrupted")])
+    with pytest.raises(OSError):
+        with checkpoint.writing(state, "relationships", ["source-edge"]):
+            api.create_relationships_bulk([{"from_id": "a", "to_id": "b", "relationship_type": "supports"}])
+    intent = json.loads(state.read_text())["pending_write"]
+    assert intent["acknowledgement"] == {"collection": "relationships", "keys": ["edge"]}
+
+
 def test_legacy_or_busy_checkpoint_never_automatically_replays(tmp_path):
     archive = export(tmp_path, memories=[{"id": "a", "content": "a"}])
     api = client()

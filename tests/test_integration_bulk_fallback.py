@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration tests for bulk relationship 409/500 fallback.
+"""Integration tests for relationship batch recovery and ambiguous writes.
 
 Runs against a live Penfield dev API with a test account.
 Creates real data, exercises actual code paths, cleans up after.

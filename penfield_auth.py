@@ -15,6 +15,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +40,30 @@ _TOKEN_CACHE_FILE = _TOKEN_CACHE_DIR / "tokens.json"
 # Polling defaults (overridden by server response)
 _DEFAULT_INTERVAL = 5
 _SLOW_DOWN_INCREMENT = 5
+
+
+@dataclass(frozen=True)
+class _OAuthProfile:
+    client_name: str
+    cache_file: Path
+    scopes: str
+
+
+_profile_override: ContextVar[Optional[_OAuthProfile]] = ContextVar("penfield_oauth_profile", default=None)
+
+
+def _profile() -> _OAuthProfile:
+    return _profile_override.get() or _OAuthProfile("penfield-import", _TOKEN_CACHE_FILE, _SCOPES)
+
+
+@contextmanager
+def oauth_profile(client_name: str, cache_dir: Path, scopes: str):
+    """Isolate one utility's registered OAuth client, cached grant and requested scopes."""
+    token = _profile_override.set(_OAuthProfile(client_name, cache_dir / "tokens.json", scopes))
+    try:
+        yield
+    finally:
+        _profile_override.reset(token)
 
 
 class AuthError(Exception):
@@ -107,9 +133,9 @@ def _validate_grant(data: Any) -> dict[str, Any]:
 
 def _save_tokens(api_url: str, token_data: dict[str, Any], *, expected, fresh=False) -> None:
     """Avoid restoring a logged-out grant or overwriting a newer login."""
-    _TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _profile().cache_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        with checkpoint_lock(_TOKEN_CACHE_FILE):
+        with checkpoint_lock(_profile().cache_file):
             cache = _load_cache()
             if cache.get(api_url) != expected:
                 raise AuthError("Login changed during authentication. Retry with the intended account.")
@@ -120,18 +146,18 @@ def _save_tokens(api_url: str, token_data: dict[str, Any], *, expected, fresh=Fa
             if "access_token" in token_data:
                 entry["saved_at"] = datetime.now(timezone.utc).isoformat()
             cache[api_url] = entry
-            write_json_atomic(_TOKEN_CACHE_FILE, cache)
+            write_json_atomic(_profile().cache_file, cache)
     except (ValueError, OSError) as exc:
         raise AuthError("Could not safely save the token cache") from exc
 
 
 def _load_cache() -> dict[str, Any]:
     """Load the full token cache file."""
-    if not _TOKEN_CACHE_FILE.exists():
+    if not _profile().cache_file.exists():
         return {}
     try:
         result: dict[str, Any] = json.loads(
-            _TOKEN_CACHE_FILE.read_text(encoding="utf-8")
+            _profile().cache_file.read_text(encoding="utf-8")
         )
         if not isinstance(result, dict) or any(not isinstance(v, dict) for v in result.values()):
             raise AuthError("Invalid token cache. Preserve it and sign in again.")
@@ -162,19 +188,19 @@ def _is_token_expired(token_data: dict[str, Any]) -> bool:
 
 
 def clear_tokens(api_url: str | None = None) -> bool:
-    if not _TOKEN_CACHE_DIR.exists():
+    if not _profile().cache_file.parent.exists():
         return False
     try:
-        with checkpoint_lock(_TOKEN_CACHE_FILE):
+        with checkpoint_lock(_profile().cache_file):
             cache = _load_cache()
             if api_url is None:
-                existed = _TOKEN_CACHE_FILE.exists()
-                _TOKEN_CACHE_FILE.unlink(missing_ok=True)
+                existed = _profile().cache_file.exists()
+                _profile().cache_file.unlink(missing_ok=True)
                 return existed
             if api_url not in cache:
                 return False
             del cache[api_url]
-            write_json_atomic(_TOKEN_CACHE_FILE, cache)
+            write_json_atomic(_profile().cache_file, cache)
             return True
     except (OSError, ValueError) as exc:
         raise AuthError("Could not safely clear the token cache") from exc
@@ -191,7 +217,7 @@ def token_status(api_url: str) -> dict[str, Any] | None:
         "expired": _is_token_expired(cached),
         "has_refresh_token": bool(cached.get("refresh_token")),
         "has_client_id": bool(cached.get("client_id")),
-        "cache_file": str(_TOKEN_CACHE_FILE),
+        "cache_file": str(_profile().cache_file),
     }
 
 
@@ -254,7 +280,7 @@ def _get_or_register_client(
 
     try:
         client_data = _http_post_json(registration_endpoint, {
-            "client_name": "penfield-import",
+            "client_name": _profile().client_name,
             "redirect_uris": ["http://localhost:8080/callback"],
             "grant_types": [
                 "urn:ietf:params:oauth:grant-type:device_code",
@@ -262,7 +288,7 @@ def _get_or_register_client(
             ],
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
-            "scope": _SCOPES,
+            "scope": _profile().scopes,
         }, timeout)
     except urllib.error.HTTPError as exc:
         raise AuthError(
@@ -366,7 +392,7 @@ def _device_code_auth(
     # Step 1: request a device code
     req = _build_form_request(device_auth_url, {
         "client_id": client_id,
-        "scope": _SCOPES,
+        "scope": _profile().scopes,
     })
 
     try:

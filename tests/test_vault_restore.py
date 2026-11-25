@@ -206,3 +206,52 @@ def test_uncertain_vault_write_cannot_be_overwritten(tmp_path):
         with cp.writing(path, "memory", ["b.md"]):
             pytest.fail("second write started with an unresolved write pending")
     assert path.read_bytes() == saved
+
+
+def test_equivalent_unicode_links_share_literal_receipts_on_full_resume_and_incremental(monkeypatch, vault, destination):
+    def git(*args):
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", *args],
+                       cwd=vault, check=True, capture_output=True)
+    git("init")
+    folder = vault / "cafe\u0301"
+    folder.mkdir()
+    target = folder / "the\u0301.md"
+    target.write_text("target")
+    (vault / "source.md").write_text("[[thé]] [[café/thé.md#topic]] [[the\u0301]]")
+    git("add", ".")
+    git("commit", "-m", "initial notes")
+    destination.create_relationships_bulk.side_effect = [importer.APIError(422, "rejected", "/relationships"), None]
+    options = ("--relationships", "inline")
+    assert run(monkeypatch, vault, *options) == 1
+    assert run(monkeypatch, vault, *options) == 0
+    state = importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME)
+    literal = next(key for key in state.memories if "/" in key)
+    assert literal == next(folder.glob("*.md")).relative_to(vault).as_posix()
+    assert state.relationships_done == {f"source.md|{literal}|references"}
+    assert [len(c.args[0]) for c in destination.create_relationships_bulk.call_args_list] == [1, 1]
+    destination.create_relationships_bulk.side_effect = None
+    added = "ele\u0301ve.md"
+    (vault / added).write_text("[[café/thé]]")
+    git("add", added)
+    git("commit", "-m", "new link to existing target")
+    assert run(monkeypatch, vault, *options) == 0
+    state = importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME)
+    added_on_disk = next(vault.glob("ele*.md")).relative_to(vault).as_posix()
+    assert state.relationships_done == {f"{name}|{literal}|references" for name in ("source.md", added_on_disk)}
+    assert destination.create_memory.call_count == 3
+    assert destination.create_relationships_bulk.call_count == 3
+
+
+def test_canonically_equivalent_stems_are_ambiguous_until_qualified(monkeypatch, vault, destination):
+    for folder, spelling in [("a", "the\u0301"), ("b", "thé")]:
+        (vault / folder).mkdir()
+        (vault / folder / (spelling + ".md")).write_text(folder)
+    source = vault / "source.md"
+    source.write_text("[[thé]]")
+    assert run(monkeypatch, vault, "--relationships", "inline") == 1
+    destination.create_memory.assert_not_called()
+    source.write_text("[[a/thé]]")
+    assert run(monkeypatch, vault, "--relationships", "inline") == 0
+    state = importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME)
+    literal = next(key for key in state.memories if key.startswith("a/"))
+    assert state.relationships_done == {f"source.md|{literal}|references"}

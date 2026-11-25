@@ -1350,6 +1350,7 @@ class TestDocumentsPhase:
         (docs_dir / "config.yaml").write_text("key: value")
         (docs_dir / "script.py").write_text("print('hello')")
         (docs_dir / "app.js").write_text("console.log('hi')")
+        (docs_dir / "types.ts").write_text("type ID = string;")
         (docs_dir / "data.csv").write_text("a,b,c")
         (docs_dir / "page.html").write_text("<html></html>")
         (docs_dir / "book.epub").write_bytes(b"PK\x03\x04 fake epub")
@@ -1365,8 +1366,11 @@ class TestDocumentsPhase:
         vtp.run_documents_phase(tmp_path, mock_client, cp, cp_path)
 
         # 10 supported types uploaded — not .png or .exe
-        assert mock_client.upload_document_bytes.call_count == 10
-        assert len(cp.documents) == 10
+        assert mock_client.upload_document_bytes.call_count == 11
+        assert len(cp.documents) == 11
+        mock_client.upload_document_bytes.assert_any_call(
+            "types.ts", b"type ID = string;", content_type="text/plain", metadata={"vault_path": "types.ts"},
+        )
         assert "image.png" not in cp.documents
         assert "binary.exe" not in cp.documents
         assert "documents.json" not in cp.documents
@@ -1715,28 +1719,29 @@ class TestRelationshipsPhaseErrorHandling:
             vtp._create_relationships_individually(mock_client, batch, cp, cp_path)
             assert mock_save.call_count == 6  # intent and verified outcome for each item
 
-    def test_non_retriable_bulk_error_preserves_batch_failure(self, tmp_path):
-        """Bulk 422 (non-409, non-500) marks all keys as failed, no fallback."""
-        cp = vtp.Checkpoint(phase="relationships", memories={
-            "note0.md": "uuid-0", "note1.md": "uuid-1",
-        })
+    @pytest.mark.parametrize("status", [400, 422])
+    def test_definite_batch_rejection_preserves_good_siblings_on_resume(self, tmp_path, status):
+        cp = vtp.Checkpoint(memories={"a.md": "a", "b.md": "b", "c.md": "c"})
         cp_path = tmp_path / "cp.json"
-
-        notes = [
-            vtp.ParsedNote(filename="note0", rel_path="note0.md", vault_dir="", content="a", body="a", frontmatter={}, tags=[], relationships=[("note1", "supports")]),
-        ]
-
-        mock_client = mock.MagicMock()
-        mock_client.create_relationships_bulk.side_effect = vtp.APIError(
-            422, '{"error":{"code":"VAL_VALIDATION_FAILED"}}', "/relationships/bulk"
-        )
-
-        vtp.run_relationships_phase(notes, mock_client, cp, cp_path)
-
-        assert len(cp.relationships_done) == 0
-        assert len(cp.failed_relationships) == 1
-        # Only 1 call — no fallback triggered
-        mock_client.create_relationships_bulk.assert_called_once()
+        note = vtp.ParsedNote("a.md", "a", "", "source", "source", {},
+                              [("b", "supports"), ("c", "references")], [])
+        api = mock.Mock()
+        def reject_bad(payloads):
+            if any(row["to_id"] == "b" for row in payloads):
+                raise vtp.APIError(status, "rejected edge", "/relationships/bulk")
+            return {}
+        api.create_relationships_bulk.side_effect = reject_bad
+        vtp.run_relationships_phase([note], api, cp, cp_path)
+        assert cp.relationships_done == {"a.md|c.md|references"}
+        assert cp.failed_relationships == ["a.md|b.md|supports"]
+        assert api.create_relationships_bulk.call_count == 3
+        api.create_relationships_bulk.side_effect = None
+        restored = vtp.Checkpoint.load(cp_path)
+        vtp.run_relationships_phase([note], api, restored, cp_path)
+        assert restored.relationships_done == {"a.md|c.md|references", "a.md|b.md|supports"}
+        assert restored.failed_relationships == []
+        assert api.create_relationships_bulk.call_count == 4
+        assert api.create_relationships_bulk.call_args.args[0][0]["to_id"] == "b"
 
     def test_already_done_skipped_in_fallback(self, tmp_path):
         """Items already in relationships_done are skipped during fallback."""
@@ -1786,8 +1791,8 @@ class TestRelationshipsPhaseErrorHandling:
         assert cp.failed_relationships == [batch[0][0]]
         assert batch[0][0] not in cp.relationships_done
 
-    def test_bulk_422_does_not_trigger_fallback(self, tmp_path):
-        """422 from bulk is NOT retried individually — it's a validation error."""
+    def test_single_rejected_edge_is_not_retried_in_the_same_pass(self, tmp_path):
+        """There are no sibling rows to isolate in a single-item batch."""
         cp = vtp.Checkpoint(phase="relationships", memories={
             "note0.md": "uuid-0", "note1.md": "uuid-1",
         })
@@ -2391,7 +2396,8 @@ class TestZipContextsPhase:
         assert call_kwargs["memory_type"] == "checkpoint"
         assert call_kwargs["importance"] == 0.9
         assert call_kwargs["tags"] == ["context", "checkpoint", "test-context"]
-        assert call_kwargs["metadata"]["checkpoint_name"] == "test-context"
+        assert call_kwargs["metadata"] is None
+        assert json.loads(call_kwargs["content"])["checkpoint_name"] == "test-context"
 
         content = json.loads(call_kwargs["content"])
         assert content["memory_ids"] == ["new-m1", "new-m2"]
@@ -2554,13 +2560,17 @@ class TestZipArtifactsPhase:
 
 
 class TestZipDocumentsPhase:
-    def test_uploads_document(self, tmp_path):
+    @pytest.mark.parametrize("filename,media_type,raw", [
+        ("report.pdf", "application/pdf", b"%PDF-fake"),
+        ("types.ts", "text/typescript", b"type ID = string;"),
+    ])
+    def test_uploads_document(self, tmp_path, filename, media_type, raw):
         docs_meta = [{
-            "id": "doc-1", "filename": "report.pdf", "mime_type": "application/pdf",
-            "file_size": 100, "metadata": {"source": "test"},
+            "id": "doc-1", "filename": filename, "mime_type": media_type,
+            "file_size": len(raw), "metadata": {"source": "test"},
             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
         }]
-        doc_files = {"documents/doc-1/original.pdf": b"%PDF-fake"}
+        doc_files = {"documents/doc-1/original." + filename.rsplit(".", 1)[1]: raw}
         data = _make_export_zip(documents_meta=docs_meta, document_files=doc_files)
         client = mock.MagicMock(spec=vtp.PenfieldClient)
         client.upload_document_bytes.return_value = {"id": "new-doc-1"}
@@ -2568,12 +2578,14 @@ class TestZipDocumentsPhase:
         cp_path = tmp_path / "cp.json"
 
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            vtp.validate_zip_manifest(zf)
             vtp.run_zip_documents_phase(zf, client, cp, cp_path)
 
         client.upload_document_bytes.assert_called_once()
         call_kwargs = client.upload_document_bytes.call_args.kwargs
-        assert call_kwargs["filename"] == "report.pdf"
-        assert call_kwargs["content_type"] == "application/pdf"
+        assert call_kwargs["filename"] == filename
+        assert call_kwargs["content_type"] == media_type
+        assert call_kwargs["data"] == raw
         assert call_kwargs["metadata"] == {"source": "test"}
         assert cp.documents["doc-1"] == "new-doc-1"
 

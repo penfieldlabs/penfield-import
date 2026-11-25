@@ -29,18 +29,44 @@ penfield-import /path/to/export.zip --checkpoint-dir /tmp/import-state
 Preview reads the archive locally. It checks the manifest and JSONL rows, record identities and referenced payloads. The manifest and each JSONL row are limited to 16 MiB. Review the counts, protected types and missing context members before choosing a destination. Use a different checkpoint directory for each archive and destination.
 
 1. **Memories.** The importer creates ordinary memories with their supported metadata. It excludes protected `identity_core` records and converts `personality_trait` to `fact`. The attribution prefix is added only when it fits.
-2. **Contexts.** Saved contexts become checkpoint memories. Members can point to ordinary memories or other contexts, including later rows. The importer resolves these dependencies and preserves membership order. An absent member, a dependency cycle or a destination conflict remains visible in the result.
+2. **Contexts.** Saved contexts become checkpoint memories. The checkpoint name and restored member count are verified in the stored JSON content. The memory metadata preserves fields from the export’s `checkpoint_metadata` object. Members can point to ordinary memories or other contexts, including later rows. The importer resolves these dependencies and preserves membership order. An absent member, a dependency cycle or a destination conflict remains visible in the result.
 3. **Relationships.** The importer remaps endpoints and submits batches of up to 100. A definite batch validation rejection can be isolated to the offending row. Destination edge fields are checked against the submitted values.
 4. **Artifacts.** UTF-8 text up to 1 MiB is eligible. Occupied paths require matching destination content. Different bytes at the same path are a conflict. Binary artifacts require a separate preservation decision.
-5. **Documents.** Eligible originals up to 20 MiB are sent with their metadata. The importer checks the returned ID and downloads the original bytes for comparison. Indexing is asynchronous.
+5. **Documents.** Eligible originals up to 20 MiB are sent with their metadata. The importer checks the returned ID and downloads the original bytes for comparison. Indexing is asynchronous. The report distinguishes verified original bytes from pending, ready, unknown or failed chunk indexing. A rerun refreshes unresolved indexing by document ID. Failed chunks result in an incomplete restore even when the top-level status says completed.
 
 Successful writes receive a destination readback. A subsequent no-op uses the checkpoint's prior receipts. It does not scan for objects that somebody later edited or deleted.
+
+### Verify a restored ZIP against the destination
+
+Run the verifier from a checkout or unpacked source distribution in the importer's virtual environment. Supply the exact ZIP, its checkpoint directory, and a new output file in an existing directory.
+
+```bash
+python tools/verify_restore.py /path/to/export.zip \
+  --checkpoint-dir /path/to/import-state \
+  --base-url https://api.penfield.app \
+  --output /path/to/review/restore-readback.jsonl
+```
+
+The verifier uses `PENFIELD_API_KEY` or a cached OAuth grant for that origin. It checks the archive digest and the verified destination identity, then fetches every mapped object by ID or artifact path. It checks document download bytes and reports chunk indexing separately. Source-managed fields are compared using the documented import transformations. Source timestamps and ownership can differ. Additional destination records outside the checkpoint are outside this comparison.
+
+The JSONL report has one row per source record and is created with owner-only permissions. Keep it private because it contains record identifiers. Exit `0` means every row matched or qualified for the protected identity exclusion. Exit `2` indicates a difference, absent receipt, partial context, omitted document tags, indexing still pending or unconfirmed, a read failure, or an unresolved write. Exit `1` indicates the check could not start or finish. The verifier leaves the checkpoint untouched.
 
 ### What completion means
 
 A ZIP run exits `0` when the supported restore is accounted for, including the documented protected-memory exclusion. Exit `2` indicates an incomplete ZIP restore. Exit `1` indicates that the importer stopped, for example on invalid input, a mismatched checkpoint or an uncertain write. Read the per-section results and keep the checkpoint for reconciliation.
 
 Ownership, server timestamps, evolution state, artifact modification dates, document tags and other server-managed fields can differ from the archive. Artifact media types are determined by the service. UUIDs in ordinary free text retain their original spelling. Explicit `memory_id:` references in context descriptions are remapped when a destination mapping is available.
+
+A tagged document can have a verified upload and an incomplete restore. The ZIP checkpoint lists its original tags under `document_tag_omissions` and the command exits 2. The documents API accepts custom metadata and has no native document tag field.
+
+### When a create has an uncertain outcome
+
+An interruption or lost response can leave the server with a new object and the client with an unconfirmed write. Keep the original input, checkpoint and command output together. A normal rerun stops at that write.
+
+1. Read `in_flight` in a ZIP checkpoint or `pending_write` in a vault checkpoint. It identifies the operation and source keys. When the service returned an ID or path before verification stopped, `acknowledgement` contains the destination collection and keys that it returned. A batch can return multiple IDs, including automatically generated inverse relationships.
+2. Verify the account and origin from the checkpoint. Retrieve each acknowledged object there. Compare memories and contexts to their transformed content and metadata, relationships to their mapped endpoints and evidence, artifacts to their exact path and contents, and documents to their metadata and original download. A server receipt alone establishes only that the service acknowledged the request.
+3. If the response never supplied an ID, use the service request logs and an inventory taken before the restore to establish ownership and outcome. A content match or an empty search is insufficient to identify an interrupted create. Preserve an inconclusive checkpoint for service-assisted recovery.
+4. On a disposable destination, the reproducible recovery path is to verify that it is empty, keep the original checkpoint for audit, and rerun from a separate checkpoint directory. For a populated destination, retain the checkpoint and verified objects for targeted reconciliation with the service operator. This version has no command to adopt a manually matched object or replay an uncertain create. Starting fresh against populated state can duplicate earlier successes.
 
 ## Vault import (Obsidian / markdown)
 
@@ -52,7 +78,7 @@ The tool runs in seven phases, checkpointing after each for crash safety:
 2. **Oversized note artifacts** - Upload and verify the original full text for notes exceeding the 10K character memory limit.
 3. **Memories** - Create a memory for each nonempty note. Oversized memories use a truncated or summarized copy that references the verified artifact.
 4. **Exported Artifacts** - Uploads pre-existing artifact files from the `Artifacts/` directory (if present)
-5. **Documents** - Uploads document files from the `Documents/` directory (if present) — supports `.pdf`, `.md`, `.txt`, `.epub`, `.json`, `.yaml`, `.yml`, `.py`, `.js`, `.csv`, `.xml`, `.html`, `.htm`
+5. **Documents** - Uploads document files from the `Documents/` directory (if present) — supports `.pdf`, `.md`, `.txt`, `.epub`, `.json`, `.yaml`, `.yml`, `.py`, `.js`, `.ts`, `.csv`, `.xml`, `.html`, `.htm`
 6. **Relationships** - Bulk-creates relationships between memories (batches of 100)
 7. **Verify** - Reconciles planned source keys with verified receipts and checks the destination memory total. The report lists document processing status separately from the uploaded byte count. Failed processing makes the run incomplete. A retry refreshes the status of the existing document.
 
@@ -363,6 +389,18 @@ The LLM client has independent retry logic.
 - [PyYAML](https://pypi.org/project/PyYAML/) (installed automatically via `pip install .`)
 
 > **Note:** PyYAML follows the YAML 1.1 spec, which treats `yes`, `no`, `on`, `off` as booleans. If your frontmatter contains these as literal string values, they will be parsed as `True`/`False`. This is standard PyYAML behavior, not a bug in this tool. Use quoted strings (`"yes"`, `"no"`) in your YAML if you need them as literal values.
+
+## Reset a disposable dev tenant's content
+
+Maintainers running restore tests can use `tools/reset_dev_content.py` from a checkout or source distribution in the importer's Python environment. First preview the counts for the expected dev tenant.
+
+```sh
+python tools/reset_dev_content.py --tenant "$EXPECTED_DEV_TENANT"
+```
+
+Adding `--apply` permanently deletes the inventoried relationships, documents, artifacts and memories (including context checkpoints and inactive memories). Use this only for a disposable dev tenant whose content you intend to remove. The tool authenticates exclusively against `https://api-dev.penfield.app`, checks the specified tenant, and preserves the tenant account and API keys. It walks every artifact folder and every list page before deleting anything. After deletion, the tool reads each inventoried record by ID or artifact path. The `confirmed_404` counts show how many records in each category returned HTTP 404. Exit zero requires all those reads to return 404, empty final inventories, and no unresolved errors. Newly added records remain visible in the final counts and require a new preview.
+
+The command uses `PENFIELD_API_KEY` when set. The key needs read access for preview and delete access to apply. Otherwise it requests a dedicated OAuth grant with read, delete and offline access. It stores that grant separately in `~/.config/penfield-dev-content-reset/tokens.json`. The importer's ordinary login and its `--reset` checkpoint option serve separate purposes.
 
 ## License
 
