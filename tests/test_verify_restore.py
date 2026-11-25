@@ -17,7 +17,8 @@ def restore(tmp_path):
     sections = {
         "memories": [{"id": "m", "content": "private text", "memory_type": "fact", "metadata": {"source": "test"}},
                      {"id": "omit", "content": "protected", "memory_type": "identity_core"}],
-        "relationships": [{"id": "r", "from_id": "m", "to_id": "c", "relationship_type": "references"}],
+        "relationships": [{"id": "r", "from_id": "m", "to_id": "c", "relationship_type": "references",
+                           "traversal_properties": {"weights": [1, 2]}}],
         "contexts": [{"id": "c", "name": "A - B", "memory_ids": ["m"], "description": "saved"}],
         "artifacts": [{"path": "/note.txt", "content_type": "text/plain"}],
         "documents": [{"id": "d", "filename": "fixture.pdf", "mime_type": "application/pdf"}],
@@ -41,7 +42,8 @@ def restore(tmp_path):
         "/memories/M": {"id":"M", "content":"private text", "memory_type":"fact", "metadata":{"source":"test"}},
         "/memories/C": {"id":"C", "content": json.dumps(context_json), "memory_type":"checkpoint", "importance":0.9,
                          "tags":["context","checkpoint","a-b"], "metadata": {}},
-        "/relationships/R": {"id":"R", "from_id":"M", "to_id":"C", "relationship_type":"references"},
+        "/relationships/R": {"id":"R", "from_id":"M", "to_id":"C", "relationship_type":"references",
+                             "traversal_properties": {"weights": [1, 2]}},
         "/artifacts": {"path":"/note.txt","content":"text\r\n","content_type":"text/plain"},
         "/documents/D": {"id":"D","filename":"fixture.pdf","content_type":"application/pdf","processing_status":"completed",
                          "embedding_progress":{"total":1, "completed":1, "pending":0, "failed":0}},
@@ -157,3 +159,20 @@ def test_document_binary_mismatch_and_read_error_are_distinct(restore, monkeypat
     assert code == 2
     assert rows["d"]["download_equal"] is False and rows["d"]["mismatched_fields"] == ["content.bytes"]
     assert rows["r"]["outcome"] == "read_error" and rows["r"]["status_code"] == 404
+
+
+@pytest.mark.parametrize("hidden", [True, False])
+def test_traversal_omission_and_drift_are_distinct(restore, monkeypatch, hidden):
+    archive, live, client = restore
+    if hidden:
+        del live["/relationships/R"]["traversal_properties"]
+    else:
+        live["/relationships/R"]["traversal_properties"]["weights"].reverse()
+    code, output = run(archive, client, monkeypatch)
+    edge = next(row for row in map(json.loads, output.read_text().splitlines()) if row["section"] == "relationships")
+    assert code == 2 and edge["destination_id"] == "R"
+    if hidden:
+        assert edge["outcome"] == "unobservable" and edge["unobservable_fields"] == ["traversal_properties"]
+        assert not edge["mismatched_fields"]
+    else:
+        assert edge["outcome"] == "mismatch" and edge["mismatched_fields"] == ["traversal_properties"]

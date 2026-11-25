@@ -33,6 +33,8 @@ def client():
     ("contexts", [{"id": "m", "name": "overlap"}]),
     ("contexts", [{"id": "c", "name": "n", "description": []}]),
     ("relationships", [{"id": "r", "from_id": "m"}]),
+    ("relationships", [{"id": "r", "from_id": "m", "to_id": "n", "relationship_type": "supports",
+                        "traversal_properties": ["invalid"]}]),
     ("relationships", [[]]),
     ("artifacts", [{"path": "/absent.txt"}]),
 ])
@@ -234,3 +236,73 @@ def test_expanded_context_checked_before_creating_any_memory(tmp_path):
     api = client()
     assert importer.run_zip_import(archive, api) == 1
     api.destination_identity.assert_not_called()
+
+
+@pytest.mark.parametrize("visibility,expected_code,expected_status", [
+    ("visible", 0, "matched"), ("hidden", 2, "unobservable"), ("different", 2, "mismatch"),
+])
+def test_traversal_receipt_survives_readbacks_and_resume(tmp_path, visibility, expected_code, expected_status):
+    properties = {"weight": 0.75, "rules": {"modes": ["a", "b"]}}
+    source = {"id": "r", "from_id": "a", "to_id": "b", "relationship_type": "supports",
+              "traversal_properties": properties}
+    archive = export(tmp_path, memories=[{"id": "a", "content": "a"}, {"id": "b", "content": "b"}],
+                     relationships=[source])
+    api = importer.PenfieldClient("https://example.invalid", access_token="test")
+    api.destination_identity = Mock(return_value="destination")
+    api.create_memory = Mock(side_effect=["A", "B"])
+    received = []
+
+    def respond(method, path, payload=None):
+        if method == "POST":
+            assert path == "/relationships/bulk" and payload[0]["traversal_properties"] == properties
+            received.extend(payload)
+            return {"data": {"created": [{"id": "R"}]}}
+        assert (method, path) == ("GET", "/relationships/R")
+        edge = dict(received[0], id="R")
+        if visibility == "hidden":
+            del edge["traversal_properties"]
+        elif visibility == "different":
+            edge["traversal_properties"] = {"weight": 0.75, "rules": {"modes": ["b", "a"]}}
+        return {"data": edge}
+
+    api.request = Mock(side_effect=respond)
+    state_path = tmp_path / importer.ZIP_CHECKPOINT_FILENAME
+    for _ in range(2):
+        assert importer.run_zip_import(archive, api) == expected_code
+        state = importer.ZipCheckpoint.load(state_path)
+        assert state.relationship_id_map == {"r": "R"} and not state.in_flight
+        assert state.relationship_traversal == {"r": expected_status}
+    # A legacy completion had a receipt but no evidence these properties were restored.
+    state.phase = "done"
+    state.relationship_traversal.clear()
+    state.save(state_path)
+    visibility = "hidden"
+    assert importer.run_zip_import(archive, api) == 2
+    visibility = "visible"
+    assert importer.run_zip_import(archive, api) == 0
+    assert importer.ZipCheckpoint.load(state_path).relationship_traversal == {"r": "matched"}
+    assert len(received) == 1
+
+
+@pytest.mark.parametrize("visible", [False, True])
+def test_conflict_requires_visible_identical_traversal(visible):
+    wanted = {"from_id": "a", "to_id": "b", "relationship_type": "supports", "traversal_properties": {"cost": 3}}
+    listed = {"id": "R", "from_id": "a", "to_id": "b", "relationship_type": "supports"}
+    detail = dict(listed, traversal_properties={"cost": 3}) if visible else listed
+    api = importer.PenfieldClient("https://example.invalid", access_token="test")
+    api.request = Mock(side_effect=[
+        importer.APIError(409, "conflict", "/relationships/bulk"),
+        {"data": {"items": [listed], "pagination": {"has_next": False}}}, {"data": detail},
+    ])
+    if visible:
+        assert api.create_relationships_bulk([wanted])["existing_identical"] is True
+    else:
+        with pytest.raises(importer.APIError) as error:
+            api.create_relationships_bulk([wanted])
+        assert error.value.status_code == 412
+
+
+def test_traversal_comparison_distinguishes_json_booleans_from_numbers():
+    wanted = {"traversal_properties": {"rules": [True, {"threshold": 2}]}}
+    assert importer._traversal_status(wanted, {"traversal_properties": {"rules": [1, {"threshold": 2}]}}) == "mismatch"
+    assert importer._traversal_status(wanted, {"traversal_properties": {"rules": [True, {"threshold": 2.0}]}}) == "matched"

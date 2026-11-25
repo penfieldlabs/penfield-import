@@ -54,7 +54,7 @@ def _different_fields(expected, actual):
                 value = {k: value[k] for k in wanted if k in value}
             elif value is None and not wanted:
                 value = {}
-        if value != wanted:
+        if not importer._json_values_equal(value, wanted):
             different.append(key)
     return different
 
@@ -117,6 +117,12 @@ def _edge(record, stored, dest, mapped, result):
         result["mismatched_fields"].append("checkpoint.unmapped_endpoint")
     if "metadata" not in stored and "relationship_metadata" in stored:
         stored = dict(stored, metadata=stored["relationship_metadata"])
+    if record.get("traversal_properties"):
+        if "traversal_properties" in stored:
+            expected["traversal_properties"] = record["traversal_properties"]
+        else:
+            result["unobservable_fields"] = ["traversal_properties"]
+            result["outcome"] = "unobservable"
     result["mismatched_fields"].extend(_different_fields(expected, stored))
 
 

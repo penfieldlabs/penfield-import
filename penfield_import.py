@@ -927,17 +927,29 @@ class PenfieldClient:
                 raise
             wanted = relationships[0]
             page = 1
+            hidden_traversal = False
             while True:
                 query = urllib.parse.urlencode({"memory_id": wanted["from_id"], "page": page, "per_page": 100})
                 listing = self._readback("/relationships?" + query)
                 for item in listing.get("items", []):
                     if self._edge_matches(item, wanted):
-                        return {"existing_identical": True, "verified_ids": [self._receipt_id(item, "/relationships")],
+                        rid = self._receipt_id(item, "/relationships")
+                        if wanted.get("traversal_properties"):
+                            detail = self.read_relationship(rid)
+                            if not self._edge_matches(detail, wanted):
+                                continue
+                            status = _traversal_status(wanted, detail)
+                            if status == "unobservable":
+                                hidden_traversal = True
+                            if status != "matched":
+                                continue
+                        return {"existing_identical": True, "verified_ids": [rid], "traversal_by_id": {rid: "matched"},
                                 "data": {"created": [], "existing": [item]}}
                 if not listing.get("pagination", {}).get("has_next"):
                     break
                 page += 1
-            raise APIError(412, "Existing relationship differs", "/relationships/bulk") from exc
+            reason = "Existing relationship traversal_properties unavailable" if hidden_traversal else "Existing relationship differs"
+            raise APIError(412, reason, "/relationships/bulk") from exc
         data = reply.get("data", {})
         created = data.get("created")
         if isinstance(created, list):
@@ -948,18 +960,26 @@ class PenfieldClient:
         extras = []
         remaining = list(enumerate(relationships))
         verified_ids = [None] * len(relationships)
+        traversal_by_id = {}
         seen_ids = set()
         for item in created:
             rid = self._receipt_id(item, "/relationships/bulk")
             if rid in seen_ids:
                 raise APIError(0, "Duplicate relationship receipt", "/relationships/bulk")
             seen_ids.add(rid)
-            edge = self._readback("/relationships/" + urllib.parse.quote(rid, safe=""))
-            for index, (source_index, wanted) in enumerate(remaining):
-                if edge.get("id") == rid and self._edge_matches(edge, wanted):
-                    verified_ids[source_index] = rid
-                    remaining.pop(index)
-                    break
+            edge = self.read_relationship(rid)
+            candidates = [(index, source_index, wanted) for index, (source_index, wanted) in enumerate(remaining)
+                          if self._edge_matches(edge, wanted)]
+            if candidates:
+                if len(candidates) > 1 and any(wanted.get("traversal_properties") for _, _, wanted in candidates):
+                    candidates = [c for c in candidates if _traversal_status(c[2], edge) == "matched"]
+                    if len(candidates) != 1 or "traversal_properties" not in edge:
+                        raise APIError(0, "Ambiguous traversal properties in bulk receipt", "/relationships/bulk")
+                index, source_index, wanted = candidates[0]
+                verified_ids[source_index] = rid
+                if wanted.get("traversal_properties"):
+                    traversal_by_id[rid] = _traversal_status(wanted, edge)
+                remaining.pop(index)
             else:
                 extras.append(edge)
         automatic = [
@@ -973,11 +993,21 @@ class PenfieldClient:
             automatic.remove(key)
         if remaining:
             raise APIError(0, "Relationship readback mismatch", "/relationships/bulk")
-        return dict(reply, verified_ids=verified_ids)
+        return dict(reply, verified_ids=verified_ids, traversal_by_id=traversal_by_id)
+
+    def read_relationship(self, rid: str) -> dict:
+        path = "/relationships/" + urllib.parse.quote(rid, safe="")
+        edge = self._readback(path)
+        if edge.get("id") != rid:
+            raise APIError(0, "Relationship readback ID mismatch", path)
+        return edge
 
     @staticmethod
     def _edge_matches(stored, wanted):
         for key, value in wanted.items():
+            # Traversal has its own receipt because some servers omit it on GET.
+            if key == "traversal_properties":
+                continue
             actual = stored.get(key)
             if key == "relationship_metadata":
                 actual = stored.get("metadata", actual)
@@ -2094,6 +2124,7 @@ class ZipCheckpoint:
     document_tag_omissions: dict[str, list[str]] = field(default_factory=dict)
     artifact_mime_mismatches: dict[str, str] = field(default_factory=dict)
     relationship_id_map: dict[str, str] = field(default_factory=dict)
+    relationship_traversal: dict[str, str] = field(default_factory=dict)
     skipped_relationships: dict[str, str] = field(default_factory=dict)
     context_unresolved: dict[str, list[str]] = field(default_factory=dict)
     in_flight: dict[str, Any] = field(default_factory=dict)
@@ -2101,7 +2132,7 @@ class ZipCheckpoint:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            **{k: v for k, v in vars(self).items() if k != "write_keys"},
+            **{k: v for k, v in vars(self).items() if k != "write_keys" and (k != "relationship_traversal" or v)},
             "relationships_done": sorted(self.relationships_done),
             "checkpoint_version": 1,
         }
@@ -2140,6 +2171,9 @@ class ZipCheckpoint:
         if any(not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags)
                for tags in checkpoint.document_tag_omissions.values()):
             raise ValueError("Invalid ZIP checkpoint document tag omissions")
+        if any(status not in {"matched", "unobservable", "mismatch", "unverified"}
+               for status in checkpoint.relationship_traversal.values()):
+            raise ValueError("Invalid ZIP checkpoint traversal verification status")
         return checkpoint
 
     def validate_source_keys(self, keys: dict[str, set[str]]) -> None:
@@ -2163,6 +2197,7 @@ class ZipCheckpoint:
                 and set(self.identical_artifacts) <= self.artifacts.keys()
                 and set(self.identical_relationships) <= self.relationships_done
                 and self.relationship_id_map.keys() <= self.relationships_done
+                and self.relationship_traversal.keys() <= self.relationships_done
                 and self.context_unresolved.keys() <= keys["contexts"]):
             raise ValueError("Checkpoint has orphaned verification outcomes")
 
@@ -2264,6 +2299,8 @@ def _validate_zip_record(section: str, rec: dict[str, Any]) -> str:
             raise ValueError("invalid tags (maximum 10, each 1–50 normalized characters)")
     if section == "relationships" and rec["from_id"] == rec["to_id"]:
         raise ValueError("self-relationships cannot be restored")
+    if section == "relationships" and "traversal_properties" in rec and not isinstance(rec["traversal_properties"], dict):
+        raise ValueError("invalid traversal_properties; expected an object")
     if rec.get("direction_type") == "INVERSE_PAIRED" and not rec.get("inverse_type"):
         raise ValueError("inverse_type required for INVERSE_PAIRED")
     if section == "contexts" and "memory_count" in rec and (
@@ -2420,6 +2457,25 @@ def run_zip_memories_phase(
         checkpoint.save(checkpoint_path)
 
 
+def _json_values_equal(left: Any, right: Any) -> bool:
+    """JSON booleans and numbers are distinct, even inside nested arrays and objects."""
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_json_values_equal(value, right[key]) for key, value in left.items())
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_json_values_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left is right
+    return left == right
+
+
+def _traversal_status(wanted: dict, stored: dict) -> str:
+    if not wanted.get("traversal_properties"):
+        return "matched"
+    if "traversal_properties" not in stored:
+        return "unobservable"
+    return "matched" if _json_values_equal(stored["traversal_properties"], wanted["traversal_properties"]) else "mismatch"
+
+
 def run_zip_relationships_phase(
     zf: zipfile.ZipFile,
     client: PenfieldClient,
@@ -2448,6 +2504,11 @@ def run_zip_relationships_phase(
         else:
             if isinstance(receipt, dict) and "verified_ids" in receipt:
                 checkpoint.relationship_id_map.update(zip(keys, receipt["verified_ids"]))
+            traversal_by_id = receipt.get("traversal_by_id", {}) if isinstance(receipt, dict) else {}
+            for key, payload in batch:
+                if payload.get("traversal_properties"):
+                    rid = checkpoint.relationship_id_map.get(key)
+                    checkpoint.relationship_traversal[key] = traversal_by_id.get(rid, "unverified")
             if isinstance(receipt, dict) and receipt.get("existing_identical") is True:
                 checkpoint.identical_relationships.extend(k for k in keys if k not in checkpoint.identical_relationships)
             checkpoint.relationships_done.update(keys)
@@ -2457,12 +2518,16 @@ def run_zip_relationships_phase(
     pending: list[tuple[str, dict[str, Any]]] = []
     for _, rec in _zip_records(zf, "relationships"):
         source_id = rec["id"]
-        if source_id in checkpoint.relationships_done:
+        done = source_id in checkpoint.relationships_done
+        if done and (not rec.get("traversal_properties") or checkpoint.relationship_traversal.get(source_id) == "matched"):
             continue
 
         new_from = endpoint(rec["from_id"])
         new_to = endpoint(rec["to_id"])
         if not new_from or not new_to:
+            if done:
+                checkpoint.relationship_traversal[source_id] = "unverified"
+                continue
             missing = [rec[k] for k, value in (("from_id", new_from), ("to_id", new_to)) if not value]
             reason = "unmapped endpoints: " + ", ".join(missing)
             logger.warning("Relationship %s: %s", source_id, reason)
@@ -2485,9 +2550,23 @@ def run_zip_relationships_phase(
             payload["confidence"] = rec["confidence"]
         if rec.get("evidence") is not None:
             payload["evidence"] = rec["evidence"]
+        if rec.get("traversal_properties"):
+            payload["traversal_properties"] = rec["traversal_properties"]
         if "metadata" in rec and rec["metadata"]:
             payload["relationship_metadata"] = rec["metadata"]
 
+        if done:
+            rid = checkpoint.relationship_id_map.get(source_id)
+            status = "unverified"
+            if rid:
+                try:
+                    stored = client.read_relationship(rid)
+                    if PenfieldClient._edge_matches(stored, payload):
+                        status = _traversal_status(payload, stored)
+                except APIError as exc:
+                    logger.warning("Cannot recheck traversal properties on relationship %s: %s", source_id, exc)
+            checkpoint.relationship_traversal[source_id] = status
+            continue
         pending.append((source_id, payload))
         if len(pending) == BULK_RELATIONSHIP_BATCH_SIZE:
             submit(pending)
@@ -2815,7 +2894,9 @@ def run_zip_verify_phase(
         failed_keys = set(getattr(checkpoint, "failed_" + section))
         failed = len(failed_keys - recorded[section])
         partial_keys = set()
-        if section == "contexts":
+        if section == "relationships":
+            partial_keys = {key for key, status in checkpoint.relationship_traversal.items() if status != "matched"}
+        elif section == "contexts":
             partial_keys = {key for key in checkpoint.context_unresolved if key in checkpoint.contexts
                             and not checkpoint.contexts[key].startswith(SKIP_SENTINEL_PREFIX)}
         elif section == "artifacts":
@@ -2832,6 +2913,10 @@ def run_zip_verify_phase(
     if checkpoint.artifact_mime_mismatches:
         print(f"Artifacts with a different destination content type: {len(checkpoint.artifact_mime_mismatches)}")
         complete = False
+    for status in ("unobservable", "mismatch", "unverified"):
+        count = sum(result == status for result in checkpoint.relationship_traversal.values())
+        if count:
+            print(f"Relationship traversal_properties {status}: {count}")
     if checkpoint.document_tag_omissions:
         print(f"Documents with source tags the API cannot restore: {len(checkpoint.document_tag_omissions)}")
         complete = False
@@ -2990,6 +3075,10 @@ def run_zip_import(
                         raise ValueError(f"Unconfirmed write {checkpoint.in_flight}; reconcile with the destination "
                                          "before resuming. Retain this checkpoint.")
                     if checkpoint.phase == "done":
+                        # Older checkpoints did not record whether traversal properties were sent or checked.
+                        for _, row in _zip_records(zf, "relationships"):
+                            if row.get("traversal_properties") and row["id"] in checkpoint.relationships_done:
+                                checkpoint.relationship_traversal.setdefault(row["id"], "unverified")
                         print("Checking saved write-time receipts for this destination.")
                         settled = all(_index_state(r["processing_status"], r.get("embedding_progress")) == "ready"
                                       for r in checkpoint.document_processing.values())
