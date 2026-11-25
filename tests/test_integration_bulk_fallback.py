@@ -5,13 +5,14 @@ Runs against a live Penfield dev API with a test account.
 Creates real data, exercises actual code paths, cleans up after.
 
 Usage:
-    python3 tests/test_integration_bulk_fallback.py --api-key <key> [--base-url <url>]
+    python3 tests/test_integration_bulk_fallback.py [--base-url <url>]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 import traceback
@@ -29,10 +30,8 @@ import penfield_import as vtp
 class TestHarness:
     """Manages test state and cleanup."""
 
-    def __init__(self, client: vtp.PenfieldClient, base_url: str, token: str):
+    def __init__(self, client: vtp.PenfieldClient):
         self.client = client
-        self.base_url = base_url
-        self.token = token
         self.memory_ids: list[str] = []
         self.relationship_ids: list[str] = []
         self.passed = 0
@@ -52,36 +51,32 @@ class TestHarness:
         resp = self.client.request("GET", f"/relationships?memory_id={memory_id}&per_page=100")
         return resp.get("data", {}).get("items", [])
 
-    def delete_relationship(self, rel_id: str) -> None:
+    def delete_and_verify(self, path: str) -> None:
         try:
-            self.client.request("DELETE", f"/relationships/{rel_id}")
-        except (vtp.APIError, json.JSONDecodeError):
-            pass
+            self.client.request("DELETE", path)
+        except vtp.APIError as exc:
+            if exc.status_code != 404:
+                self.assert_true(False, f"Cleanup failed for {path}: {exc}")
+                return
+        try:
+            self.client.request("GET", path)
+        except vtp.APIError as exc:
+            self.assert_eq(exc.status_code, 404, f"Removed {path}")
+        else:
+            self.assert_true(False, f"Object remains at {path}")
 
     def cleanup(self) -> None:
-        print("\n--- Cleanup ---")
-        # Gather all relationships for all test memories
-        seen_rels = set()
+        seen_rels = set(self.relationship_ids)
         for mem_id in self.memory_ids:
             try:
-                rels = self.get_relationships_for(mem_id)
-                for r in rels:
-                    seen_rels.add(r["id"])
-            except vtp.APIError:
-                pass
-        for rel_id in self.relationship_ids:
-            seen_rels.add(rel_id)
-
+                seen_rels.update(r["id"] for r in self.get_relationships_for(mem_id))
+            except vtp.APIError as exc:
+                if exc.status_code != 404:
+                    self.assert_true(False, f"Could not enumerate edges for {mem_id}")
         for rel_id in seen_rels:
-            self.delete_relationship(rel_id)
-        print(f"  Deleted {len(seen_rels)} relationships")
-
+            self.delete_and_verify(f"/relationships/{rel_id}")
         for mem_id in self.memory_ids:
-            try:
-                self.client.request("DELETE", f"/memories/{mem_id}")
-            except (vtp.APIError, json.JSONDecodeError):
-                pass
-        print(f"  Deleted {len(self.memory_ids)} memories")
+            self.delete_and_verify(f"/memories/{mem_id}")
 
     def assert_eq(self, actual: Any, expected: Any, msg: str) -> None:
         if actual == expected:
@@ -633,7 +628,7 @@ def test_crash_mid_batch_and_resume(h: TestHarness) -> None:
     Patches the client to raise SystemExit after the bulk create succeeds
     but BEFORE the checkpoint is saved — simulating a kill -9 at the worst
     possible moment. The server has the relationships, the checkpoint doesn't.
-    Resume must recover via the 409 fallback.
+    Resume must preserve the unknown write for reconciliation.
     """
     print("\n[Scenario 15] Crash mid-batch and resume from checkpoint")
 
@@ -690,22 +685,15 @@ def test_crash_mid_batch_and_resume(h: TestHarness) -> None:
             rels_m1 = h.get_relationships_for(m1)
             h.assert_true(len(rels_m1) >= 1, "Server has batch 1 relationships despite crash")
 
-            # --- RESUME ---
             cp_resumed = vtp.Checkpoint.load(cp_path)
-            cp_resumed.memories = memory_map  # Not serialized by relationships phase
-            h.assert_eq(len(cp_resumed.relationships_done), 0, "Resumed checkpoint starts at 0 done")
-
-            vtp.run_relationships_phase(notes, h.client, cp_resumed, cp_path)
-
-            h.assert_eq(len(cp_resumed.relationships_done), 4, "All 4 done after resume")
-            h.assert_eq(len(cp_resumed.failed_relationships), 0, "0 failures after resume")
-
-            # Verify all 4 relationships exist on server
-            all_rels = set()
-            for mid in [m1, m2, m3, m4]:
-                for r in h.get_relationships_for(mid):
-                    all_rels.add(r["id"])
-            h.assert_true(len(all_rels) >= 4, f"Server has >= 4 relationships (got {len(all_rels)})")
+            h.assert_true(bool(cp_resumed.pending_write), "Unconfirmed batch retained for reconciliation")
+            h.assert_eq(len(cp_resumed.relationships_done), 0, "Unconfirmed rows have no success receipts")
+            try:
+                vtp.run_relationships_phase(notes, h.client, cp_resumed, cp_path)
+            except ValueError:
+                h.assert_true(True, "Unconfirmed writes require reconciliation")
+            else:
+                h.assert_true(False, "An interrupted write was replayed")
 
     finally:
         vtp.BULK_RELATIONSHIP_BATCH_SIZE = original_batch_size
@@ -764,108 +752,18 @@ def test_full_scale_batch_100_items(h: TestHarness) -> None:
     print(f"    Verified {len(total_server_rels)} relationships via spot-check")
 
 
-def test_network_failure_mid_batch_and_resume(h: TestHarness) -> None:
-    """Scenario 17: Simulate network failure mid-fallback using iptables.
+def test_ambiguous_post_is_not_replayed(h: TestHarness) -> None:
+    """Inject a lost acknowledgement into this client without changing host networking."""
+    from unittest.mock import patch
 
-    Adds a firewall rule to block traffic to the API host during the
-    individual fallback, then removes it and resumes. Verifies the circuit
-    breaker fires and resume completes the remaining items.
-
-    Requires root/sudo for iptables. Skipped if not available.
-    """
-    print("\n[Scenario 17] Network failure mid-batch via iptables")
-
-    import subprocess
-    import socket
-
-    # Resolve API host IP
-    api_host = h.base_url.split("//")[1].split("/")[0]
-    try:
-        api_ip = socket.gethostbyname(api_host)
-    except socket.gaierror:
-        print("    SKIP: Cannot resolve API host")
-        return
-
-    # Check if we have iptables access
-    try:
-        subprocess.run(
-            ["sudo", "-n", "iptables", "-L", "OUTPUT", "-n"],
-            capture_output=True, timeout=5, check=True,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-        print("    SKIP: No passwordless sudo/iptables access")
-        return
-
-    m1 = h.create_memory("S17-A")
-    m2 = h.create_memory("S17-B")
-    m3 = h.create_memory("S17-C")
-    m4 = h.create_memory("S17-D")
-    m5 = h.create_memory("S17-E")
-
-    # Pre-create first relationship to force 409 on bulk → individual fallback
-    h.client.create_relationships_bulk([
-        {"from_id": m1, "to_id": m2, "relationship_type": "supports"},
-    ])
-
-    memory_map = {
-        "s17a.md": m1, "s17b.md": m2, "s17c.md": m3,
-        "s17d.md": m4, "s17e.md": m5,
-    }
-    relationships = [
-        ("s17a.md", "s17b", "supports"),    # duplicate
-        ("s17b.md", "s17c", "follows"),      # new
-        ("s17c.md", "s17d", "references"),   # new — will fail (network blocked)
-        ("s17d.md", "s17e", "supports"),     # new — will fail or be deferred
-    ]
-    notes = make_notes(memory_map, relationships)
-
-    block_rule = ["sudo", "-n", "iptables", "-I", "OUTPUT", "-d", api_ip, "-j", "REJECT"]
-    unblock_rule = ["sudo", "-n", "iptables", "-D", "OUTPUT", "-d", api_ip, "-j", "REJECT"]
-
-    with tempfile.TemporaryDirectory() as tmp:
-        cp, cp_path = make_checkpoint(Path(tmp), memory_map)
-
-        # Patch client: after 2 individual items succeed, block the network
-        original_bulk = h.client.create_relationships_bulk
-        call_count = [0]
-        blocked = [False]
-
-        def intercepting_bulk(payloads):
-            call_count[0] += 1
-            # call 1 = original bulk (will 409)
-            # call 2 = individual item 1 (duplicate, 409)
-            # call 3 = individual item 2 (new, succeeds)
-            # call 4+ = block network before these
-            if call_count[0] == 4 and not blocked[0]:
-                subprocess.run(block_rule, capture_output=True, timeout=5)
-                blocked[0] = True
-            return original_bulk(payloads)
-
-        h.client.create_relationships_bulk = intercepting_bulk
-
+    with patch.object(h.client, "_raw_request", side_effect=vtp.APIError(503, "unknown", "/memories")) as send:
         try:
-            # Run with network cut — should hit circuit breaker or timeout errors
-            vtp.run_relationships_phase(notes, h.client, cp, cp_path)
-        except Exception:
-            pass  # Network errors may propagate
-        finally:
-            # ALWAYS unblock, even if the test crashes
-            if blocked[0]:
-                subprocess.run(unblock_rule, capture_output=True, timeout=5)
-            h.client.create_relationships_bulk = original_bulk
-
-        # Checkpoint should have at least the first 2 items done
-        cp_after_crash = vtp.Checkpoint.load(cp_path)
-        done_count = len(cp_after_crash.relationships_done)
-        h.assert_true(done_count >= 2, f"At least 2 items done before network failure (got {done_count})")
-        h.assert_true(done_count < 4, f"Not all items done (network was blocked) (got {done_count})")
-
-        # --- RESUME with network restored ---
-        cp_after_crash.memories = memory_map
-        vtp.run_relationships_phase(notes, h.client, cp_after_crash, cp_path)
-
-        h.assert_eq(len(cp_after_crash.relationships_done), 4, "All 4 done after resume")
-        h.assert_eq(len(cp_after_crash.failed_relationships), 0, "0 failures after resume")
+            h.client.request("POST", "/memories", {"content": "simulated write"})
+        except vtp.APIError as exc:
+            h.assert_eq(exc.status_code, 503, "Ambiguous write status survives")
+        else:
+            h.assert_true(False, "Ambiguous write must surface")
+        h.assert_eq(send.call_count, 1, "Ambiguous write was sent once")
 
 
 # ---------------------------------------------------------------------------
@@ -874,22 +772,22 @@ def test_network_failure_mid_batch_and_resume(h: TestHarness) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Integration tests for bulk relationship fallback")
-    parser.add_argument("--api-key", required=True, help="Penfield API key")
+
     parser.add_argument("--base-url", default="https://api-dev.penfield.app/api/v2",
                         help="Penfield API base URL")
     args = parser.parse_args()
+
+    if not os.environ.get("PENFIELD_API_KEY"):
+        parser.error("Set PENFIELD_API_KEY for the disposable dev tenant")
 
     # Authenticate
     print(f"Authenticating against {args.base_url}...")
     client = vtp.PenfieldClient(
         base_url=args.base_url.rstrip("/").replace("/api/v2", ""),
-        api_key=args.api_key,
+        api_key=os.environ["PENFIELD_API_KEY"],
     )
-    # Force token exchange
-    client._ensure_token()
-    print(f"Authenticated. Tenant: {client._access_token[:40] if client._access_token else 'NONE'}...\n")
-
-    h = TestHarness(client, args.base_url, client._access_token or "")
+    print(f"Verified destination: {client.destination_identity()}")
+    h = TestHarness(client)
 
     try:
         test_happy_path_bulk_succeeds(h)
@@ -908,7 +806,7 @@ def main() -> int:
         test_checkpoint_round_trip_after_fallback(h)
         test_crash_mid_batch_and_resume(h)
         test_full_scale_batch_100_items(h)
-        test_network_failure_mid_batch_and_resume(h)
+        test_ambiguous_post_is_not_replayed(h)
     except Exception as e:
         print(f"\n!!! UNEXPECTED EXCEPTION: {e}")
         traceback.print_exc()

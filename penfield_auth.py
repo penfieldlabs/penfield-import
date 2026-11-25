@@ -10,6 +10,7 @@ Mirrors the auth flow from penfield-export, using only stdlib (no httpx).
 from __future__ import annotations
 
 import json
+from penfield_io import checkpoint_lock, open_request, origin, write_json_atomic
 import time
 import urllib.error
 import urllib.parse
@@ -22,7 +23,7 @@ from typing import Any, Optional
 try:
     from penfield_import import __version__
 except ImportError:
-    __version__ = "2.0.0"
+    __version__ = "2.0.1"
 
 BASE_URL = "https://api.penfield.app"
 USER_AGENT = f"penfield-import/{__version__}"
@@ -58,7 +59,7 @@ class AuthResult:
 def _http_get_json(url: str, timeout: float = 10.0) -> Any:
     """GET JSON from a URL."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with open_request(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -86,7 +87,7 @@ def _http_post_json(url: str, body: dict[str, Any], timeout: float = 30.0) -> An
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with open_request(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -94,27 +95,34 @@ def _http_post_json(url: str, body: dict[str, Any], timeout: float = 30.0) -> An
 # Token cache
 # ---------------------------------------------------------------------------
 
-def _save_tokens(api_url: str, token_data: dict[str, Any]) -> None:
-    """Persist tokens to the cache file (owner-only permissions)."""
+def _validate_grant(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict) or not isinstance(data.get("access_token"), str) or not data["access_token"].strip():
+        raise AuthError("Authorization server returned an invalid access token")
+    if "expires_in" in data and (type(data["expires_in"]) is not int or data["expires_in"] <= 0):
+        raise AuthError("Authorization server returned an invalid token lifetime")
+    if "refresh_token" in data and (not isinstance(data["refresh_token"], str) or not data["refresh_token"]):
+        raise AuthError("Authorization server returned an invalid refresh token")
+    return data
+
+
+def _save_tokens(api_url: str, token_data: dict[str, Any], *, expected, fresh=False) -> None:
+    """Avoid restoring a logged-out grant or overwriting a newer login."""
     _TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-
-    cache = _load_cache()
-
-    entry = cache.get(api_url, {})
-    for f in ("access_token", "refresh_token", "client_id"):
-        if f in token_data:
-            entry[f] = token_data[f]
-    if "expires_in" in token_data:
-        entry["expires_in"] = token_data["expires_in"]
-    if "access_token" in token_data:
-        entry["saved_at"] = datetime.now(timezone.utc).isoformat()
-
-    cache[api_url] = entry
-
-    _TOKEN_CACHE_FILE.write_text(
-        json.dumps(cache, indent=2), encoding="utf-8"
-    )
-    _TOKEN_CACHE_FILE.chmod(0o600)
+    try:
+        with checkpoint_lock(_TOKEN_CACHE_FILE):
+            cache = _load_cache()
+            if cache.get(api_url) != expected:
+                raise AuthError("Login changed during authentication. Retry with the intended account.")
+            entry = {} if fresh else dict(cache.get(api_url, {}))
+            for key in ("access_token", "refresh_token", "client_id", "expires_in"):
+                if key in token_data:
+                    entry[key] = token_data[key]
+            if "access_token" in token_data:
+                entry["saved_at"] = datetime.now(timezone.utc).isoformat()
+            cache[api_url] = entry
+            write_json_atomic(_TOKEN_CACHE_FILE, cache)
+    except (ValueError, OSError) as exc:
+        raise AuthError("Could not safely save the token cache") from exc
 
 
 def _load_cache() -> dict[str, Any]:
@@ -125,9 +133,11 @@ def _load_cache() -> dict[str, Any]:
         result: dict[str, Any] = json.loads(
             _TOKEN_CACHE_FILE.read_text(encoding="utf-8")
         )
+        if not isinstance(result, dict) or any(not isinstance(v, dict) for v in result.values()):
+            raise AuthError("Invalid token cache. Preserve it and sign in again.")
         return result
-    except (json.JSONDecodeError, OSError):
-        return {}
+    except (ValueError, OSError) as exc:
+        raise AuthError("Unreadable token cache. Preserve it and sign in again.") from exc
 
 
 def _load_tokens(api_url: str) -> dict[str, Any] | None:
@@ -136,41 +146,38 @@ def _load_tokens(api_url: str) -> dict[str, Any] | None:
     return cache.get(api_url)
 
 
+def _remaining_seconds(token_data: dict[str, Any]) -> int:
+    try:
+        saved_at = datetime.fromisoformat(token_data.get("saved_at", "2000-01-01"))
+        if saved_at.tzinfo is None:
+            saved_at = saved_at.replace(tzinfo=timezone.utc)
+        expiry = saved_at + timedelta(seconds=token_data.get("expires_in", 0))
+        return int((expiry - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _is_token_expired(token_data: dict[str, Any]) -> bool:
-    """Check whether the cached access token has expired (5-min buffer)."""
-    saved_at = datetime.fromisoformat(
-        token_data.get("saved_at", "2000-01-01")
-    )
-    if saved_at.tzinfo is None:
-        saved_at = saved_at.replace(tzinfo=timezone.utc)
-    expires_in = token_data.get("expires_in", 0)
-    expiry = saved_at + timedelta(seconds=expires_in - 300)
-    return datetime.now(timezone.utc) > expiry
+    return _remaining_seconds(token_data) <= 300
 
 
 def clear_tokens(api_url: str | None = None) -> bool:
-    """Remove cached tokens. Returns True if anything was removed."""
-    if not _TOKEN_CACHE_FILE.exists():
+    if not _TOKEN_CACHE_DIR.exists():
         return False
-
-    if api_url is None:
-        _TOKEN_CACHE_FILE.unlink()
-        return True
-
     try:
-        cache = json.loads(_TOKEN_CACHE_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-
-    if api_url not in cache:
-        return False
-
-    del cache[api_url]
-    _TOKEN_CACHE_FILE.write_text(
-        json.dumps(cache, indent=2), encoding="utf-8"
-    )
-    _TOKEN_CACHE_FILE.chmod(0o600)
-    return True
+        with checkpoint_lock(_TOKEN_CACHE_FILE):
+            cache = _load_cache()
+            if api_url is None:
+                existed = _TOKEN_CACHE_FILE.exists()
+                _TOKEN_CACHE_FILE.unlink(missing_ok=True)
+                return existed
+            if api_url not in cache:
+                return False
+            del cache[api_url]
+            write_json_atomic(_TOKEN_CACHE_FILE, cache)
+            return True
+    except (OSError, ValueError) as exc:
+        raise AuthError("Could not safely clear the token cache") from exc
 
 
 def token_status(api_url: str) -> dict[str, Any] | None:
@@ -198,7 +205,21 @@ def _discover_oauth_endpoints(
     """Discover OAuth endpoints from well-known metadata."""
     url = f"{api_url.rstrip('/')}/.well-known/oauth-authorization-server"
     try:
-        return _http_get_json(url, timeout)
+        data = _http_get_json(url, timeout)
+        api_origin = origin(api_url)
+        known_issuers = {
+            "https://api.penfield.app": "https://auth.penfield.app",
+            "https://api-dev.penfield.app": "https://auth-dev.penfield.app",
+        }
+        issuer = origin(data["issuer"])
+        if issuer not in (api_origin, known_issuers.get(api_origin)):
+            raise AuthError("Unexpected authorization server issuer")
+        for field in ("token_endpoint", "device_authorization_endpoint", "registration_endpoint"):
+            if field in data and origin(data[field]) != issuer:
+                raise AuthError(f"Unexpected authorization server origin for {field}")
+        return data
+    except (ValueError, KeyError, TypeError) as exc:
+        raise AuthError("Invalid authorization server metadata") from exc
     except urllib.error.HTTPError as exc:
         raise AuthError(
             f"OAuth discovery failed (HTTP {exc.code}). "
@@ -252,8 +273,10 @@ def _get_or_register_client(
             f"Network error during client registration: {exc}"
         ) from exc
 
+    if not isinstance(client_data, dict) or not isinstance(client_data.get("client_id"), str) or not client_data["client_id"]:
+        raise AuthError("Client registration returned no client ID")
     new_client_id: str = client_data["client_id"]
-    _save_tokens(api_url, {"client_id": new_client_id})
+    _save_tokens(api_url, {"client_id": new_client_id}, expected=cached)
     return new_client_id
 
 
@@ -275,7 +298,7 @@ def _refresh_access_token(
         "client_id": client_id,
     })
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with open_request(req, timeout=timeout) as resp:
             if resp.status == 200:
                 return json.loads(resp.read().decode())
     except (urllib.error.HTTPError, urllib.error.URLError):
@@ -307,8 +330,9 @@ def refresh_oauth_token(api_url: str = BASE_URL) -> Optional[AuthResult]:
     if not new_tokens:
         return None
 
+    _validate_grant(new_tokens)
     new_tokens["client_id"] = client_id
-    _save_tokens(api_url, new_tokens)
+    _save_tokens(api_url, new_tokens, expected=cached)
     return AuthResult(
         access_token=new_tokens["access_token"],
         refresh_token=new_tokens.get("refresh_token"),
@@ -346,7 +370,7 @@ def _device_code_auth(
     })
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with open_request(req, timeout=timeout) as resp:
             device_data: dict[str, Any] = json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         raise AuthError(
@@ -394,7 +418,7 @@ def _device_code_auth(
         })
 
         try:
-            with urllib.request.urlopen(poll_req, timeout=timeout) as resp:
+            with open_request(poll_req, timeout=timeout) as resp:
                 if resp.status == 200:
                     return json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:
@@ -456,7 +480,7 @@ def get_valid_token(
                 return AuthResult(
                     access_token=cached["access_token"],
                     refresh_token=cached.get("refresh_token"),
-                    expires_in=cached.get("expires_in"),
+                    expires_in=_remaining_seconds(cached),
                 )
 
             # Attempt refresh
@@ -468,8 +492,9 @@ def get_valid_token(
                     discovery, refresh, client_id
                 )
                 if new_tokens:
+                    _validate_grant(new_tokens)
                     new_tokens["client_id"] = client_id
-                    _save_tokens(api_url, new_tokens)
+                    _save_tokens(api_url, new_tokens, expected=cached)
                     return AuthResult(
                         access_token=new_tokens["access_token"],
                         refresh_token=new_tokens.get("refresh_token"),
@@ -479,9 +504,10 @@ def get_valid_token(
     # Full device code flow
     discovery = _discover_oauth_endpoints(api_url)
     client_id = _get_or_register_client(api_url, discovery)
-    token_data = _device_code_auth(discovery, client_id)
+    expected = _load_tokens(api_url)
+    token_data = _validate_grant(_device_code_auth(discovery, client_id))
     token_data["client_id"] = client_id
-    _save_tokens(api_url, token_data)
+    _save_tokens(api_url, token_data, expected=expected, fresh=True)
     return AuthResult(
         access_token=token_data["access_token"],
         refresh_token=token_data.get("refresh_token"),

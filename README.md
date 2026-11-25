@@ -26,19 +26,21 @@ penfield-import /path/to/export.zip --checkpoint-dir /tmp/import-state
 
 ### How ZIP import works
 
-The tool validates the manifest, then processes five phases in the order mandated by the export spec:
+Preview reads the archive locally. It checks the manifest and JSONL rows, record identities and referenced payloads. The manifest and each JSONL row are limited to 16 MiB. Review the counts, protected types and missing context members before choosing a destination. Use a different checkpoint directory for each archive and destination.
 
-1. **Memories** — Creates memories from `memories.jsonl`. Passes through `memory_type`, `importance`, `confidence`, `source_type`, `metadata`, and `tags`. Skips `identity_core` (API does not allow creation). Downgrades `personality_trait` to `fact`.
-2. **Relationships** — Remaps source/target IDs to the new tenant's IDs, then bulk-creates relationships in batches of 100 with individual fallback on batch failure.
-3. **Contexts** — Recreates saved contexts as `checkpoint` memories via the memories API, remapping all memory references. Handles 409 conflict (duplicate checkpoint name) gracefully.
-4. **Artifacts** — Extracts text artifacts from the ZIP and uploads them. Binary files (detected via null bytes) are skipped. Validates path format (no spaces or special chars) and enforces the 1 MB size limit.
-5. **Documents** — Extracts document files and uploads them via multipart form with metadata.
+1. **Memories.** The importer creates ordinary memories with their supported metadata. It excludes protected `identity_core` records and converts `personality_trait` to `fact`. The attribution prefix is added only when it fits.
+2. **Contexts.** Saved contexts become checkpoint memories. Members can point to ordinary memories or other contexts, including later rows. The importer resolves these dependencies and preserves membership order. An absent member, a dependency cycle or a destination conflict remains visible in the result.
+3. **Relationships.** The importer remaps endpoints and submits batches of up to 100. A definite batch validation rejection can be isolated to the offending row. Destination edge fields are checked against the submitted values.
+4. **Artifacts.** UTF-8 text up to 1 MiB is eligible. Occupied paths require matching destination content. Different bytes at the same path are a conflict. Binary artifacts require a separate preservation decision.
+5. **Documents.** Eligible originals up to 20 MiB are sent with their metadata. The importer checks the returned ID and downloads the original bytes for comparison. Indexing is asynchronous.
 
-Each record is checkpointed individually. Resume by re-running the same command.
+Successful writes receive a destination readback. A subsequent no-op uses the checkpoint's prior receipts. It does not scan for objects that somebody later edited or deleted.
 
-### Fields not preserved on round-trip
+### What completion means
 
-The following fields are present in the export for archival purposes but cannot be set via the public API: `surprise_score`, `user_id`, `is_evolution`, `evolution_id`, `evolution_type`, `parent_memory_id`, `lifecycle_state`, `created_at`, `updated_at` (memories); `is_auto_detected` (relationships); `tags` (documents).
+A ZIP run exits `0` when the supported restore is accounted for, including the documented protected-memory exclusion. Exit `2` indicates an incomplete ZIP restore. Exit `1` indicates that the importer stopped, for example on invalid input, a mismatched checkpoint or an uncertain write. Read the per-section results and keep the checkpoint for reconciliation.
+
+Ownership, server timestamps, evolution state, artifact modification dates, document tags and other server-managed fields can differ from the archive. Artifact media types are determined by the service. UUIDs in ordinary free text retain their original spelling. Explicit `memory_id:` references in context descriptions are remapped when a destination mapping is available.
 
 ## Vault import (Obsidian / markdown)
 
@@ -47,12 +49,12 @@ The following fields are present in the export for archival purposes but cannot 
 The tool runs in seven phases, checkpointing after each for crash safety:
 
 1. **Parse** - Reads all `.md`, `.txt`, `.markdown`, and `.text` files, extracts YAML frontmatter and typed relationships
-2. **Memories** - Creates one Penfield memory per note (content + tags). Oversized notes get a truncated or summarized memory with a reference to the artifact path.
-3. **Artifacts** - Uploads full content for notes exceeding the 10K character memory limit
+2. **Oversized note artifacts** - Upload and verify the original full text for notes exceeding the 10K character memory limit.
+3. **Memories** - Create a memory for each nonempty note. Oversized memories use a truncated or summarized copy that references the verified artifact.
 4. **Exported Artifacts** - Uploads pre-existing artifact files from the `Artifacts/` directory (if present)
 5. **Documents** - Uploads document files from the `Documents/` directory (if present) — supports `.pdf`, `.md`, `.txt`, `.epub`, `.json`, `.yaml`, `.yml`, `.py`, `.js`, `.csv`, `.xml`, `.html`, `.htm`
 6. **Relationships** - Bulk-creates relationships between memories (batches of 100)
-7. **Verify** - Queries Penfield to confirm import counts match
+7. **Verify** - Reconciles planned source keys with verified receipts and checks the destination memory total. The report lists document processing status separately from the uploaded byte count. Failed processing makes the run incomplete. A retry refreshes the status of the existing document.
 
 ### Important: fresh Penfield knowledge base
 
@@ -61,7 +63,9 @@ This tool **creates** memories and relationships. It does not update or deduplic
 ## Installation
 
 ```bash
-pip install .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install .
 ```
 
 This installs the `penfield-import` command. All examples below use it. If you prefer to run without installing, substitute `python penfield_import.py` wherever you see `penfield-import`.
@@ -69,7 +73,7 @@ This installs the `penfield-import` command. All examples below use it. If you p
 ## Quick start
 
 ```bash
-# Authenticate with Penfield (one-time, opens browser)
+# Authenticate with Penfield (follow the displayed URL and code)
 penfield-import --login
 
 # Import a Penfield portal export ZIP
@@ -88,10 +92,12 @@ penfield-import --version
 
 The tool supports two authentication methods:
 
+Production defaults to `https://api.penfield.app`. For internal dev testing, set `PENFIELD_BASE_URL=https://api-dev.penfield.app` before supplying a dev credential, or pass `--base-url https://api-dev.penfield.app` on every command, including login and logout. Use the key issued by the selected environment. OAuth grants are cached separately by origin. The CLI reads exported environment variables.
+
 ### OAuth device code flow (recommended)
 
 ```bash
-# Log in (opens browser for authorization)
+# Log in (open the displayed URL for authorization)
 python penfield_import.py --login
 
 # Check token status
@@ -100,7 +106,7 @@ python penfield_import.py --auth-status
 # Force re-authentication
 python penfield_import.py --login --reauth
 
-# Log out (clear cached tokens)
+# Log out of the selected API origin
 python penfield_import.py --logout
 ```
 
@@ -115,7 +121,7 @@ python penfield_import.py /path/to/notes
 
 If `PENFIELD_API_KEY` is set, it takes priority over cached OAuth tokens. The API key is exchanged for a short-lived JWT before any requests are made. **The API key is never accepted as a CLI argument** (keys passed as arguments are visible in `ps aux`).
 
-Both auth methods handle token refresh automatically. If a token expires mid-import, it refreshes transparently.
+Both auth methods handle token refresh automatically. After token refresh the importer checks the destination identity again before continuing.
 
 ## What gets imported
 
@@ -156,7 +162,7 @@ The `type:` field in frontmatter is mapped directly to Penfield's `memory_type`.
 
 - **`type: identity_core`** — skipped entirely. Identity core memories are managed by Penfield's personality system and cannot be created via the memories API.
 - **`type: personality_trait`** — imported as `fact` with an `[Imported personality_trait]` prefix. Personality traits are also managed by the personality system; this is the closest equivalent that the memories API accepts.
-- **`type: checkpoint`** — imported as `reference`. The `checkpoint` memory type is the persistence layer for MCP cognitive handoffs created by [`save_context`](https://penfield.app/docs/mcp/mcp-integration.md#save_context); each record stores a JSON `{"checkpoint_name", "description", "memory_ids"}` blob that `restore_context` and `list_contexts` parse at read time. There is no public API path that reproduces that JSON shape — the only legitimate way to create a checkpoint is through `save_context` itself. A checkpoint note in an exported vault has had its JSON unwrapped into a plain description and `references:` wikilinks during export, so re-importing it as a checkpoint would produce a malformed record that is no longer restorable. Downgrading to `reference` preserves its content and `references:` relationships as an ordinary summary memory that is still discoverable via search and graph traversal.
+- **`type: checkpoint`** — imported as `reference`. The `checkpoint` memory type is the persistence layer for MCP cognitive handoffs created by [`save_context`](https://penfield.app/docs/mcp/mcp-integration.md#save_context); each record stores a JSON `{"checkpoint_name", "description", "memory_ids"}` blob that `restore_context` and `list_contexts` parse at read time. A vault note lacks the structured membership data available in a portal ZIP. A checkpoint note in an exported vault has had its JSON unwrapped into a plain description and `references:` wikilinks during export, so re-importing it as a checkpoint would produce a malformed record that is no longer restorable. Downgrading to `reference` preserves its content and `references:` relationships as an ordinary summary memory that is still discoverable via search and graph traversal.
 
 All other frontmatter types (`fact`, `insight`, `conversation`, `correction`, `reference`, `task`, `strategy`, `relationship`) are passed through to Penfield as-is.
 
@@ -215,7 +221,7 @@ If your frontmatter has a `tags` array, those are passed to Penfield's memory ta
 Notes over 10,000 characters can't fit in a single Penfield memory. The tool handles this by creating two records for each oversized note:
 
 1. **A memory** — a truncated or summarized version of the note, with a reference to the artifact path where the full content is stored. This memory is searchable and appears in recall results.
-2. **An artifact** — the full, unmodified note content stored at `/oversize-notes/<filename>`.
+2. **An artifact** — the full, unmodified note content stored at `/oversize-notes/<encoded-relative-path>`.
 
 The memory is how you find the note. The artifact is how you read the full thing.
 
@@ -225,7 +231,7 @@ The note is smart-truncated at the nearest section heading or paragraph break (~
 
 ### LLM mode (`--llm`)
 
-The full note is sent to an OpenAI-compatible API for summarization. The summary becomes the memory content, with the artifact path appended. Falls back to smart truncation if the LLM fails.
+The formatted memory text and note filename are sent to the configured API. The frontmatter option controls which metadata appears in that text. The summary becomes the memory content, with the artifact path appended. Falls back to smart truncation if the LLM fails.
 
 ```bash
 export LLM_API_KEY="your-key"
@@ -243,7 +249,7 @@ python penfield_import.py /path/to/vault --claude
 python penfield_import.py /path/to/vault --claude --claude-model sonnet
 ```
 
-Defaults to `haiku` for speed and cost. Any model name accepted by `claude --model` works.
+The subprocess receives the same formatted text as LLM mode. It runs in a private temporary directory with built-in and MCP tools disabled. An unsupported CLI flag triggers the local truncation fallback. Defaults to `haiku`. Any model name accepted by `claude --model` works.
 
 ### Why artifacts, not documents?
 
@@ -273,7 +279,7 @@ penfield-import [INPUT_PATH] [options]
 | `--include-frontmatter` | off | Include YAML metadata in memory content |
 | `--skip-dirs` | `_meta _templates _penfield _config Artifacts Documents` | Directory names to skip |
 | `--dry-run` | off | Parse and report stats, no API calls |
-| `--reset` | off | Delete checkpoint before starting |
+| `--reset` | off | Start fresh after preflight and destination verification |
 | `-v` / `--verbose` | off | Debug logging |
 | `--version` | | Print version and exit |
 
@@ -290,17 +296,18 @@ penfield-import [INPUT_PATH] [options]
 
 | Variable | Required | Description |
 |----------|----------|-------------|
+| `PENFIELD_BASE_URL` | No | API origin. An explicit `--base-url` takes precedence. Export variables in your shell. |
 | `PENFIELD_API_KEY` | No (alternative to `--login`) | Penfield API key (`tm_<tenant>_ak_<key>`). Takes priority over OAuth if set. |
 | `LLM_API_KEY` | Only with `--llm` | OpenAI-compatible API key |
 
 ## Checkpoint and crash recovery
 
-The tool writes a checkpoint file after each individual operation. If the import is interrupted, re-run the same command and it picks up where it left off.
+A ZIP checkpoint records the SHA-256 of the archive and the verified destination. A vault checkpoint records the source file hashes, import options and verified destination identity. Re-running retries rejected writes and skips confirmed successes. When an interruption leaves an unknown write outcome, the checkpoint identifies the record or batch. Reconcile it against the destination before continuing.
 
 - Vault imports use `.penfield_import_checkpoint.json`
 - ZIP imports use `.penfield_zip_import_checkpoint.json`
-- Checkpoint is written atomically (write to `.tmp`, then `os.replace()`)
-- Use `--reset` to delete the checkpoint and start fresh
+- Checkpoints are written atomically. Concurrent writers using the same checkpoint are rejected.
+- `--reset` starts with fresh local tracking and can create duplicates at a populated destination. A dry run leaves the checkpoint untouched.
 - Use `--checkpoint-dir` to store the checkpoint somewhere other than the source directory
 
 ### Incremental import (git vaults)
@@ -313,12 +320,11 @@ python penfield_import.py /path/to/vault
 
 # Later: add new notes to the vault, commit, then re-run
 python penfield_import.py /path/to/vault
-# → "Incremental import: 3 new file(s) since commit abc1234..."
 ```
 
-- Only **new files** (git status `A`) are imported. Modified or deleted files are ignored — use `--reset` for a full re-import if you need to refresh everything.
+- Incremental imports accept committed additions, including files in `Artifacts/` and `Documents/`. If previously imported inputs change, reconcile the destination before starting a different restore.
 - The checkpoint stores the full `{rel_path: memory_id}` map from all prior runs, so relationships from new notes to existing notes resolve correctly.
-- Non-git vaults are unaffected — they run a full import each time. Re-running without `--reset` exits with "Previous import completed."
+- For non-Git vaults, repeating a completed import checks the source snapshot and destination identity. A changed snapshot requires a separate restore decision.
 
 ## Directory structure
 
@@ -326,7 +332,7 @@ python penfield_import.py /path/to/vault
 - Directories named `_meta`, `_templates`, `_penfield`, `_config`, `Artifacts`, and `Documents` are skipped by default (configurable with `--skip-dirs`). `Artifacts/` and `Documents/` have their own dedicated import phases and should not be processed as memories.
 - No specific directory structure is required - works with any folder layout
 - Files are identified by their relative path (e.g., `concepts/trust.md`), so duplicate filenames in different directories are stored as separate memories
-- **Duplicate filename caveat:** Relationship targets in frontmatter use note names without paths (e.g., `[[trust]]`). If multiple files share the same filename in different directories, relationships targeting that name are skipped with a warning (the target is ambiguous). For best results, use unique filenames
+- **Duplicate filename caveat:** Relationship targets in frontmatter use note names without paths (e.g., `[[trust]]`). If multiple files share the same stem, use a vault-relative path such as `[[projects/trust.md]]` to identify the intended note. The preview reports ambiguous and unresolved links before import.
 
 ### Supported layouts
 
@@ -337,15 +343,17 @@ The tool recognizes the Penfield export layout but works with any subset:
 - `Artifacts/` — files uploaded to Penfield as artifacts, preserving directory structure as the artifact path
 - `Documents/` — files uploaded to Penfield's documents system (PDFs, etc.) for chunked full-text search
 
+Vault note and text artifact inputs must be valid UTF-8. Previews also inspect attachments and graph links. Regular files are read within the selected vault. Symlinked files and nested symlink directories are excluded, and symlinked attachment roots are rejected.
+
 A vault may contain any subset of these directories. An `Artifacts/`-only or `Documents/`-only vault is a valid import — the tool skips phases that have no content without aborting.
 
 ## Rate limiting
 
 The tool uses a sliding-window rate limiter (200 requests/minute) and handles server responses:
 
-- **429 (rate limited):** Exponential backoff (2^n seconds, max 60s), resets on success
+- **429 (rate limited):** Honors a valid Retry-After delay, otherwise uses exponential backoff. The last refusal is returned after the retry budget.
 - **401 (unauthorized):** Automatically refreshes the token (OAuth refresh or API key re-exchange)
-- **5xx (server error):** Retries up to 3 times with backoff
+- **5xx (server error):** Read requests can retry with backoff. An ambiguous create stops for reconciliation.
 
 The LLM client has independent retry logic.
 

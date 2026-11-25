@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.0.1] - Unreleased
+
+- Validate ZIP records and payloads before writing. Restore nested contexts in dependency order and report unresolved membership.
+- Bind recovery to input and destination, journal writes, lock state and return a failing status for incomplete restores. Preserve recovery state during preview.
+- Read back memory and relationship fields, artifact content and document bytes. Separate identical existing objects from conflicting ones.
+- Fix vault parsing, incremental discovery, duplicate note names and oversized note preservation.
+- Honor the destination environment setting, isolate cached grants, verify refreshed credentials and restrict credentialed redirects.
+- Fix the build backend requirement and source distribution test collection.
+
 ## [2.0.0] - 2026-06-03
 
 ### Added
@@ -35,8 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ZIP import completed" and exits, matching vault behavior. Previously it silently
   re-ran the verification phase.
 - **Binary artifact detection** — Artifacts containing null bytes in the first 8 KB
-  are now uploaded as binary (`application/octet-stream`) instead of incorrectly being
-  sent as UTF-8 text.
+  are identified and skipped. The original release announcement incorrectly described an upload.
 - **Artifact size validation** — Artifacts exceeding the 1 MB API limit are skipped
   with a warning and checkpointed so they are never re-attempted.
 - **Ambiguous filename collision** — When multiple vault files share the same filename,

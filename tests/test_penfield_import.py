@@ -648,14 +648,12 @@ class TestCheckpoint:
         assert loaded.phase == "artifacts"
         assert loaded.memories == {"note.md": "id-123"}
 
-    def test_corrupt_checkpoint_file_recovery(self, tmp_path):
-        """Corrupt checkpoint returns fresh Checkpoint."""
+    def test_corrupt_checkpoint_requires_reconciliation(self, tmp_path):
         checkpoint_path = tmp_path / "corrupt.json"
         checkpoint_path.write_text("{ invalid json ]")
-
-        result = vtp.Checkpoint.load(checkpoint_path)
-        assert result.phase == "parse"
-        assert result.memories == {}
+        with pytest.raises(ValueError, match="Cannot resume corrupt vault checkpoint"):
+            vtp.Checkpoint.load(checkpoint_path)
+        assert checkpoint_path.read_text() == "{ invalid json ]"
 
     def test_missing_checkpoint_file_returns_fresh(self, tmp_path):
         """Missing checkpoint file returns fresh Checkpoint."""
@@ -970,7 +968,7 @@ class TestBuildRelationshipList:
         with caplog.at_level("WARNING"):
             result = vtp.build_relationship_list(notes, checkpoint)
         assert "Duplicate filename" in caplog.text
-        assert "skipped (ambiguous)" in caplog.text
+        assert "ambiguous" in caplog.text
         # dir2/test.md has the relationship; "other" resolves to "other.md"
         assert len(result) == 1
         _, payload = result[0]
@@ -1362,12 +1360,12 @@ class TestDocumentsPhase:
         cp_path = tmp_path / ".penfield_import_checkpoint.json"
 
         mock_client = mock.MagicMock()
-        mock_client.upload_document.return_value = {"id": "doc-uuid"}
+        mock_client.upload_document_bytes.return_value = {"id": "doc-uuid"}
 
         vtp.run_documents_phase(tmp_path, mock_client, cp, cp_path)
 
         # 10 supported types uploaded — not .png or .exe
-        assert mock_client.upload_document.call_count == 10
+        assert mock_client.upload_document_bytes.call_count == 10
         assert len(cp.documents) == 10
         assert "image.png" not in cp.documents
         assert "binary.exe" not in cp.documents
@@ -1385,12 +1383,12 @@ class TestDocumentsPhase:
         cp = vtp.Checkpoint()
         cp_path = tmp_path / ".penfield_import_checkpoint.json"
         mock_client = mock.MagicMock()
-        mock_client.upload_document.return_value = {"id": "doc-uuid"}
+        mock_client.upload_document_bytes.return_value = {"id": "doc-uuid"}
 
         vtp.run_documents_phase(tmp_path, mock_client, cp, cp_path)
 
         # Only small.txt uploaded; huge.pdf skipped
-        assert mock_client.upload_document.call_count == 1
+        assert mock_client.upload_document_bytes.call_count == 1
         assert len(cp.documents) == 1
         assert "huge.pdf" in cp.failed_documents
 
@@ -1402,7 +1400,7 @@ class TestDocumentsPhase:
 
         vtp.run_documents_phase(tmp_path, mock_client, cp, cp_path)
 
-        mock_client.upload_document.assert_not_called()
+        mock_client.upload_document_bytes.assert_not_called()
         assert len(cp.documents) == 0
 
 
@@ -1540,16 +1538,15 @@ class TestGitNewFilesSince:
         new = vtp._git_new_files_since(tmp_path, sha)
         assert len(new) == 0
 
-    def test_returns_empty_for_invalid_sha(self, tmp_path):
-        """Returns empty list when the baseline SHA is not reachable."""
+    def test_rejects_invalid_git_baseline(self, tmp_path):
         self._init_repo(tmp_path)
-        new = vtp._git_new_files_since(tmp_path, "0000000000000000000000000000000000000000")
-        assert new == []
+        with pytest.raises(ValueError, match="Cannot determine changes"):
+            vtp._git_new_files_since(tmp_path, "0" * 40)
 
-    def test_returns_empty_outside_git(self, tmp_path):
+    def test_reports_unavailable_git_history(self, tmp_path):
         """Returns empty list when not in a git repo."""
-        new = vtp._git_new_files_since(tmp_path, "abc123")
-        assert new == []
+        with pytest.raises(ValueError, match="Cannot determine changes"):
+            vtp._git_new_files_since(tmp_path, "abc123")
 
 
 class TestParseVaultRestrictTo:
@@ -1642,30 +1639,22 @@ class TestRelationshipsPhaseErrorHandling:
         # 1 bulk attempt + 3 individual
         assert mock_client.create_relationships_bulk.call_count == 4
 
-    def test_bulk_500_triggers_individual_fallback(self, tmp_path):
-        """Bulk 500 (after request() retries exhausted) falls back to individual."""
-        cp = vtp.Checkpoint(phase="relationships", memories={
-            "note0.md": "uuid-0", "note1.md": "uuid-1",
-        })
-        cp_path = tmp_path / "cp.json"
+    @pytest.mark.parametrize("status", [0, 500, 502, 503])
+    def test_ambiguous_batch_is_journaled_without_replay(self, tmp_path, status):
+        checkpoint = vtp.Checkpoint(memories={"note0.md": "id0", "note1.md": "id1"})
+        path = tmp_path / "cp.json"
+        note = vtp.ParsedNote("note0.md", "note0", "", "a", "a", {}, [("note1", "supports")], [])
+        client = mock.Mock()
+        client.create_relationships_bulk.side_effect = vtp.APIError(status, "uncertain", "/relationships/bulk")
+        with pytest.raises(ValueError, match="Uncertain relationships write"):
+            vtp.run_relationships_phase([note], client, checkpoint, path)
+        client.create_relationships_bulk.assert_called_once()
+        saved = vtp.Checkpoint.load(path)
+        assert saved.pending_write == {"kind": "relationships", "keys": ["note0.md|note1.md|supports"]}
+        assert not saved.relationships_done
 
-        notes = [
-            vtp.ParsedNote(filename="note0", rel_path="note0.md", vault_dir="", content="a", body="a", frontmatter={}, tags=[], relationships=[("note1", "supports")]),
-        ]
-
-        mock_client = mock.MagicMock()
-        mock_client.create_relationships_bulk.side_effect = [
-            vtp.APIError(500, "Internal Server Error", "/relationships/bulk"),
-            {"data": {"created": []}},  # individual succeeds
-        ]
-
-        vtp.run_relationships_phase(notes, mock_client, cp, cp_path)
-
-        assert len(cp.relationships_done) == 1
-        assert cp.failed_relationships == []
-
-    def test_individual_409_marked_as_done(self, tmp_path):
-        """In fallback, individual 409 means duplicate — marked as done."""
+    def test_unverified_individual_409_is_reported_as_failure(self, tmp_path):
+        """An unverified conflict cannot certify the requested relationship."""
         batch = self._make_batch(3)
         cp = vtp.Checkpoint()
         cp_path = tmp_path / "cp.json"
@@ -1679,8 +1668,8 @@ class TestRelationshipsPhaseErrorHandling:
 
         vtp._create_relationships_individually(mock_client, batch, cp, cp_path)
 
-        assert len(cp.relationships_done) == 3
-        assert cp.failed_relationships == []
+        assert len(cp.relationships_done) == 2
+        assert cp.failed_relationships == [batch[1][0]]
 
     def test_individual_non_retriable_error_tracked_as_failure(self, tmp_path):
         """In fallback, non-409/non-500 errors are tracked as failures."""
@@ -1700,50 +1689,18 @@ class TestRelationshipsPhaseErrorHandling:
         assert len(cp.failed_relationships) == 1
         assert batch[1][0] in cp.failed_relationships
 
-    def test_circuit_breaker_aborts_on_consecutive_500s(self, tmp_path):
-        """3 consecutive 500s in fallback aborts remaining items."""
-        batch = self._make_batch(6)
+    def test_uncertain_individual_preserves_prior_success_and_stops(self, tmp_path):
+        batch = self._make_batch(3)
         cp = vtp.Checkpoint()
-        cp_path = tmp_path / "cp.json"
-
-        mock_client = mock.MagicMock()
-        mock_client.create_relationships_bulk.side_effect = [
-            {"data": {"created": []}},  # item 0 succeeds
-            vtp.APIError(500, "error", "/relationships/bulk"),  # item 1
-            vtp.APIError(500, "error", "/relationships/bulk"),  # item 2
-            vtp.APIError(500, "error", "/relationships/bulk"),  # item 3 → triggers breaker
-        ]
-
-        vtp._create_relationships_individually(mock_client, batch, cp, cp_path)
-
-        # Only 4 API calls made (1 success + 3 failures), not 6
-        assert mock_client.create_relationships_bulk.call_count == 4
-        assert len(cp.relationships_done) == 1
-        # Items 1-5 should all be in failed_relationships
-        assert len(cp.failed_relationships) == 5
-
-    def test_circuit_breaker_resets_on_non_500(self, tmp_path):
-        """A success between 500s resets the consecutive counter."""
-        batch = self._make_batch(6)
-        cp = vtp.Checkpoint()
-        cp_path = tmp_path / "cp.json"
-
-        mock_client = mock.MagicMock()
-        mock_client.create_relationships_bulk.side_effect = [
-            vtp.APIError(500, "error", "/relationships/bulk"),  # item 0 — counter=1
-            vtp.APIError(500, "error", "/relationships/bulk"),  # item 1 — counter=2
-            {"data": {"created": []}},                          # item 2 — counter=0
-            vtp.APIError(500, "error", "/relationships/bulk"),  # item 3 — counter=1
-            vtp.APIError(500, "error", "/relationships/bulk"),  # item 4 — counter=2
-            {"data": {"created": []}},                          # item 5 — counter=0
-        ]
-
-        vtp._create_relationships_individually(mock_client, batch, cp, cp_path)
-
-        # All 6 calls made — breaker never tripped
-        assert mock_client.create_relationships_bulk.call_count == 6
-        assert len(cp.relationships_done) == 2
-        assert len(cp.failed_relationships) == 4
+        path = tmp_path / "cp.json"
+        client = mock.Mock()
+        client.create_relationships_bulk.side_effect = [{}, vtp.APIError(500, "unknown", "/relationships")]
+        with pytest.raises(ValueError, match="Uncertain relationship write"):
+            vtp._create_relationships_individually(client, batch, cp, path)
+        saved = vtp.Checkpoint.load(path)
+        assert saved.relationships_done == {batch[0][0]}
+        assert saved.pending_write["keys"] == [batch[1][0]]
+        assert client.create_relationships_bulk.call_count == 2
 
     def test_checkpoint_saved_per_item_in_fallback(self, tmp_path):
         """Checkpoint is saved after each individual create for crash safety."""
@@ -1756,7 +1713,7 @@ class TestRelationshipsPhaseErrorHandling:
 
         with mock.patch.object(cp, "save", wraps=cp.save) as mock_save:
             vtp._create_relationships_individually(mock_client, batch, cp, cp_path)
-            assert mock_save.call_count == 3
+            assert mock_save.call_count == 6  # intent and verified outcome for each item
 
     def test_non_retriable_bulk_error_preserves_batch_failure(self, tmp_path):
         """Bulk 422 (non-409, non-500) marks all keys as failed, no fallback."""
@@ -1812,7 +1769,7 @@ class TestRelationshipsPhaseErrorHandling:
         assert cp.failed_relationships == []
         assert len(cp.relationships_done) == 2
 
-    def test_fallback_clears_prior_failure_on_duplicate(self, tmp_path):
+    def test_unverified_duplicate_preserves_prior_failure(self, tmp_path):
         """Item previously in failed_relationships is removed when found as duplicate."""
         batch = self._make_batch(1)
         cp = vtp.Checkpoint()
@@ -1826,52 +1783,8 @@ class TestRelationshipsPhaseErrorHandling:
 
         vtp._create_relationships_individually(mock_client, batch, cp, cp_path)
 
-        assert cp.failed_relationships == []
-        assert batch[0][0] in cp.relationships_done
-
-    def test_bulk_502_triggers_individual_fallback(self, tmp_path):
-        """502 Bad Gateway from bulk also triggers fallback (not just 500)."""
-        cp = vtp.Checkpoint(phase="relationships", memories={
-            "note0.md": "uuid-0", "note1.md": "uuid-1",
-        })
-        cp_path = tmp_path / "cp.json"
-
-        notes = [
-            vtp.ParsedNote(filename="note0", rel_path="note0.md", vault_dir="", content="a", body="a", frontmatter={}, tags=[], relationships=[("note1", "supports")]),
-        ]
-
-        mock_client = mock.MagicMock()
-        mock_client.create_relationships_bulk.side_effect = [
-            vtp.APIError(502, "Bad Gateway", "/relationships/bulk"),
-            {"data": {"created": []}},  # individual succeeds
-        ]
-
-        vtp.run_relationships_phase(notes, mock_client, cp, cp_path)
-
-        assert len(cp.relationships_done) == 1
-        assert cp.failed_relationships == []
-
-    def test_bulk_503_triggers_individual_fallback(self, tmp_path):
-        """503 Service Unavailable from bulk also triggers fallback."""
-        cp = vtp.Checkpoint(phase="relationships", memories={
-            "note0.md": "uuid-0", "note1.md": "uuid-1",
-        })
-        cp_path = tmp_path / "cp.json"
-
-        notes = [
-            vtp.ParsedNote(filename="note0", rel_path="note0.md", vault_dir="", content="a", body="a", frontmatter={}, tags=[], relationships=[("note1", "supports")]),
-        ]
-
-        mock_client = mock.MagicMock()
-        mock_client.create_relationships_bulk.side_effect = [
-            vtp.APIError(503, "Service Unavailable", "/relationships/bulk"),
-            {"data": {"created": []}},  # individual succeeds
-        ]
-
-        vtp.run_relationships_phase(notes, mock_client, cp, cp_path)
-
-        assert len(cp.relationships_done) == 1
-        assert cp.failed_relationships == []
+        assert cp.failed_relationships == [batch[0][0]]
+        assert batch[0][0] not in cp.relationships_done
 
     def test_bulk_422_does_not_trigger_fallback(self, tmp_path):
         """422 from bulk is NOT retried individually — it's a validation error."""
@@ -2126,7 +2039,7 @@ class TestPathSafetyDocuments:
 
         vtp.run_documents_phase(tmp_path, mock_client, cp, cp_path)
 
-        mock_client.upload_document.assert_not_called()
+        mock_client.upload_document_bytes.assert_not_called()
         assert cp.documents.get("PRN.txt") == vtp.SKIP_UNSAFE_PATH
 
     def test_safe_document_still_uploaded(self, tmp_path):
@@ -2138,11 +2051,11 @@ class TestPathSafetyDocuments:
         cp = vtp.Checkpoint()
         cp_path = tmp_path / ".penfield_import_checkpoint.json"
         mock_client = mock.MagicMock()
-        mock_client.upload_document.return_value = {"id": "doc-uuid"}
+        mock_client.upload_document_bytes.return_value = {"id": "doc-uuid"}
 
         vtp.run_documents_phase(tmp_path, mock_client, cp, cp_path)
 
-        mock_client.upload_document.assert_called_once()
+        mock_client.upload_document_bytes.assert_called_once()
         assert "report.pdf" in cp.documents
 
 
@@ -2296,11 +2209,12 @@ class TestZipCheckpoint:
         assert cp.phase == "manifest"
         assert cp.memory_id_map == {}
 
-    def test_fresh_on_corrupt(self, tmp_path):
+    def test_preserve_corrupt_checkpoint(self, tmp_path):
         path = tmp_path / "cp.json"
         path.write_text("not json{{{", encoding="utf-8")
-        cp = vtp.ZipCheckpoint.load(path)
-        assert cp.phase == "manifest"
+        with pytest.raises(ValueError, match="Invalid ZIP checkpoint"):
+            vtp.ZipCheckpoint.load(path)
+        assert path.read_text() == "not json{{{"
 
 
 class TestZipMemoriesPhase:
@@ -2428,7 +2342,8 @@ class TestZipRelationshipsPhase:
             vtp.run_zip_relationships_phase(zf, client, cp, cp_path)
 
         client.create_relationships_bulk.assert_not_called()
-        assert "r1" in cp.relationships_done
+        assert "r1" in cp.skipped_relationships
+        assert "r1" not in cp.relationships_done
 
     def test_skips_dangling_to_id(self, tmp_path, caplog):
         rels = [{"id": "r1", "from_id": "old-a", "to_id": "missing", "relationship_type": "supports"}]
@@ -2634,7 +2549,8 @@ class TestZipArtifactsPhase:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             vtp.run_zip_artifacts_phase(zf, client, cp, cp_path)
 
-        assert cp.artifacts["/exists.md"] == "/exists.md"
+        assert "/exists.md" not in cp.artifacts
+        assert cp.failed_artifacts == ["/exists.md"]
 
 
 class TestZipDocumentsPhase:
@@ -2773,6 +2689,7 @@ class TestZipImportEndToEnd:
             return f"new-{call_count[0]}"
 
         client = mock.MagicMock(spec=vtp.PenfieldClient)
+        client.destination_identity.return_value = "test-destination"
         client.create_memory.side_effect = mock_create_memory
         client.create_relationships_bulk.return_value = {}
         client.create_artifact.return_value = {}
@@ -2821,11 +2738,14 @@ class TestCreateMemoryExtended:
         client._access_token = "tok"
         client._api_key = "key"
         client._rate_limiter = mock.MagicMock()
-        client.request = mock.MagicMock(return_value={"data": {"id": "uuid-1"}})
+        client.request = mock.MagicMock(side_effect=[
+            {"data": {"id": "uuid-1"}},
+            {"data": {"id": "uuid-1", "content": "test", "tags": ["t"], "memory_type": "fact"}},
+        ])
 
         result = client.create_memory(content="test", tags=["t"], memory_type="fact")
 
-        payload = client.request.call_args[0][2]
+        payload = client.request.call_args_list[0].args[2]
         assert payload == {"content": "test", "tags": ["t"], "memory_type": "fact"}
         assert "importance" not in payload
         assert result == "uuid-1"
@@ -2836,7 +2756,10 @@ class TestCreateMemoryExtended:
         client._access_token = "tok"
         client._api_key = "key"
         client._rate_limiter = mock.MagicMock()
-        client.request = mock.MagicMock(return_value={"data": {"id": "uuid-2"}})
+        client.request = mock.MagicMock(side_effect=[
+            {"data": {"id": "uuid-2"}},
+            {"data": {"id": "uuid-2", "content": "test", "tags": ["t"], "memory_type": "fact", "importance": 0.7, "confidence": 0.9, "source_type": "direct_input", "metadata": {"key": "val"}}},
+        ])
 
         result = client.create_memory(
             content="test", tags=["t"], memory_type="fact",
@@ -2844,7 +2767,7 @@ class TestCreateMemoryExtended:
             metadata={"key": "val"},
         )
 
-        payload = client.request.call_args[0][2]
+        payload = client.request.call_args_list[0].args[2]
         assert payload["importance"] == 0.7
         assert payload["confidence"] == 0.9
         assert payload["source_type"] == "direct_input"

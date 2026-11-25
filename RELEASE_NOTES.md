@@ -1,40 +1,21 @@
-# Penfield Import v2.0.0
+# Penfield Import 2.0.1 release candidate
 
-Import Penfield portal exports or Obsidian vaults into [Penfield](https://penfield.app).
+This branch is for external review. Version 2.0.0 could exit successfully after a rejected write and could skip data when reusing a checkpoint. Keep the original archives and all existing checkpoints when investigating an earlier restore.
 
-## What's new in v2.0.0
+## Restoring with the candidate
 
-- **ZIP/JSONL import** — Penfield portal exports (v1 ZIP archives) can now be imported directly. The tool validates the manifest, processes all five JSONL data files in phase order (memories → relationships → contexts → artifacts → documents), and checkpoints after each record for crash safety.
-- **Protected type handling** — `identity_core` memories are skipped (the API does not allow creation). `personality_trait` memories are downgraded to `fact` with a prefix note.
-- **Context reconstruction** — Exported contexts are recreated as `checkpoint` memories via the memories API, preserving checkpoint names and remapped memory references.
-- **Binary artifact detection** — Artifacts with null bytes in the first 8 KB are correctly uploaded as binary instead of being misidentified as UTF-8 text.
-- **Artifact size validation** — Artifacts exceeding the 1 MB API limit are skipped with a warning and checkpointed so they are never re-attempted on resume.
-- **Ambiguous filename collision fix** — Vault imports with duplicate filenames across directories now skip ambiguous relationship targets with a warning instead of resolving them arbitrarily.
-- **Extended memory creation** — `memory_type`, `importance`, `confidence`, `source_type`, and `metadata` are now passed through to the API when present in export data.
+1. Create a virtual environment and install the package as described in the README.
+2. Run `penfield-import INPUT --dry-run`. Review protected types, graph references and unsupported data. Preview makes no API calls or checkpoint changes.
+3. Choose the destination explicitly with `--base-url` or export `PENFIELD_BASE_URL`. Use a dedicated checkpoint directory per input and destination. Set credentials through the environment or use the device code displayed by `--login`.
+4. Run the import and retain its output and checkpoint. A partial ZIP returns 2. A stopped ZIP or incomplete vault returns nonzero. A protected identity exclusion is reported separately.
+5. Retry a definite rejection using the same input, destination and state. If a write has an uncertain outcome, inspect its source keys and compare the destination before any replay. A fresh checkpoint can create duplicates.
 
-## Fields not preserved on round-trip
+## Compatibility and verification
 
-The following fields are present in exports but assigned server-side and cannot be set via the API:
+The candidate refuses automatic reuse of older, unbound ledgers. An existing 2.0.0 success summary is insufficient evidence of completeness. Compare mapped records and source payloads against the destination, especially artifact collisions, skipped or failed relationships and saved context membership. Use separate destination state for any fresh test restore.
 
-- Timestamps (`created_at`, `updated_at`) on memories, relationships, and documents
-- Ownership (`user_id` on memories, `created_by` on relationships, `uploaded_by` on documents)
-- `is_auto_detected` on relationships
+At write time, the client reads back accepted memories and edges, compares text artifacts and checks original document bytes. Processing and embedding completion are separate from byte verification. Service-managed fields, protected memory types and binary artifacts have the preservation limits described in the README. A no-op resume relies on the saved receipts.
 
-## Authentication
+## External review before merge
 
-Two options:
-- **OAuth device code flow** (recommended) — `penfield-import --login` opens a browser for authorization. Tokens are cached and refreshed automatically.
-- **API key** — set `PENFIELD_API_KEY` environment variable. The key is exchanged for a short-lived token before any requests.
-
-## Crash safety
-
-Every operation is checkpointed. If the import is interrupted, re-run the same command and it picks up where it left off. ZIP and vault imports use separate checkpoint files so they don't interfere.
-
-## Requirements
-
-- Python 3.9+
-- [PyYAML](https://pypi.org/project/PyYAML/) (installed automatically via `pip install .`)
-
-## License
-
-AGPL-3.0
+Exercise the installed wheel against disposable dev destination state. Include a rejected write followed by retry, an occupied artifact path with different content, a malformed late record, the same archive with a second destination, nested contexts, document download, duplicate context names and OAuth account rotation. Verify fixture cleanup by ID. Keep private exports, credentials and local reconciliation logs outside the repository.

@@ -30,3 +30,8 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local recovery state
+.penfield_zip_import_checkpoint.json
+.penfield_zip_import_checkpoint.json.lock
+.penfield_import_checkpoint.json.lock
