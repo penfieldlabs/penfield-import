@@ -29,6 +29,8 @@ The source distribution includes the dev-only content reset helper. It inventori
 
 ## Earlier review builds
 
+R5b (`0d00652`) could advance past a protected note whose committed version had become importable. With the correct working copy, repeating the import now restores the missing note and retains confirmed siblings. R5b could also accept unexpected tags on an untagged memory or a different media type for a document explicitly declared as `application/octet-stream`. Resuming rechecks affected receipts against the source.
+
 On dev, a PDF with no extractable text returned HTTP 400 and left a document with failed processing. ZIP and vault imports now preserve the upload intent and stop on retry. Operators upgrading from an older checkpoint with an unreceipted document failure should reconcile it against the destination before another upload.
 
 The first 2.0.1 review build, `675da708`, could accept stale context references and could equate JSON booleans with numbers when comparing relationship evidence. For a ZIP restored with that build, retain the original input and checkpoint and run the current read-only verifier. It reports affected rows, including repeated document IDs. It also checks explicit UUID references in context descriptions. An absent referenced source can produce an incomplete result even when every context member listed in the archive has been restored. Repeating an import against a populated destination with a fresh checkpoint can create duplicates.

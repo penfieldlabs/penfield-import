@@ -84,6 +84,8 @@ Ownership, server timestamps, evolution state, artifact modification dates, docu
 
 When an older checkpoint lacks description verification, a resume reads the existing destination context and compares its description with the current source-to-destination map. A stale description remains incomplete until reconciled; the importer retains the existing receipt and avoids creating a duplicate.
 
+An empty memory tag list is compared with the destination. A ZIP document that explicitly declares `application/octet-stream` must read back with that media type. An omitted media type allows the service to infer it. A mismatch in either check keeps the destination ID for a read-only recheck on retry.
+
 A tagged document can have a verified upload and an incomplete restore. The ZIP checkpoint lists its original tags under `document_tag_omissions` and the command exits 2. The documents API accepts custom metadata and has no native document tag field.
 
 Each source document needs its own destination ID, even when two files have identical names and bytes. ZIP relationship rows can share a destination ID only when their submitted payloads match and the service confirmed an identical existing edge for every row beyond the first. Two fresh creates returning the same ID stop the import. The verifier marks every row involved in an invalid shared receipt.
@@ -343,6 +345,7 @@ penfield-import /path/to/vault
 ```
 
 - On the first import and on increments, the importer checks all eligible committed inputs in scope. A missing committed file or a working copy that differs from the pinned Git blob stops the run before any destination write. Restore any missing or modified tracked input from the intended commit before retrying. Eligible untracked working files can also be included on the first import. Vault artifacts are hashed again immediately before upload.
+- A previously protected `identity_core` note can become an ordinary note in a later commit. Preview and restore require the new committed bytes before importing any sibling. Restoring the committed file allows its missing receipt to be created on retry, including after an older checkpoint advanced past it.
 - Before advancing a saved Git commit, preview and import compare the committed changes with the paths already recorded. An edit, removal, or rename of a recorded input requires reconciliation even if the working copy still contains the previously imported bytes. Upgrades check the entire pinned tree before retrying a partial import or certifying an older baseline. The Git validation marker lives in the local importer checkpoint. Portal exports declare their format separately in the ZIP’s `manifest.json` under `schema_version`.
 - Incremental imports compare each new note, artifact and document with its Git blob at the recorded commit. Text files may use CRLF working-copy line endings for an LF blob. Other differences stop the run before any writes. Commit the edit or restore the committed content before retrying. Changes to previously imported inputs require reconciliation with the destination.
 - The checkpoint stores the full `{rel_path: memory_id}` map from all prior runs, so relationships from new notes to existing notes resolve correctly.

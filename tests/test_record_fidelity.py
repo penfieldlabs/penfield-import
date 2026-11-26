@@ -342,3 +342,43 @@ def test_scalar_types_in_receipt_from_older_candidate(tmp_path, monkeypatch, wit
     service.objects["/memories/A"].update(importance=1, confidence=1)
     assert imp.run_zip_import(archive, service.api) == 0
     assert verify(archive)[0] == 0 and len(service.posted) == 1
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["fresh", "old-success"])
+@pytest.mark.parametrize("section,field", [("memories", "tags"), ("documents", "content_type")])
+def test_empty_tags_and_declared_generic_media_keep_partial_receipts(tmp_path, monkeypatch, legacy, section, field):
+    service = Service(monkeypatch)
+    doc = dict(document(), mime_type="application/octet-stream")
+    archive = archive_with(tmp_path, documents=[doc] if section == "documents" else [])
+    saved = tmp_path / imp.ZIP_CHECKPOINT_FILENAME
+    different = not legacy
+    original = service.fields
+
+    def fields(record):
+        result = original(record)
+        if section == "memories" and record["id"] == "A":
+            result["tags"] = ["unexpected"] if different else []
+        if section == "documents" and record["id"] == "D":
+            result["content_type"] = "text/plain" if different else "application/octet-stream"
+        return result
+
+    monkeypatch.setattr(service, "fields", fields)
+    if legacy:
+        assert imp.run_zip_import(archive, service.api, tmp_path) == 0
+        old = json.loads(saved.read_bytes())
+        del old["checked_memory_tags"], old["document_type_receipts"]
+        saved.write_text(json.dumps(old))
+        different = True
+    assert imp.run_zip_import(archive, service.api, tmp_path) == 2
+    state = imp.ZipCheckpoint.load(saved)
+    ids = state.documents if section == "documents" else state.memory_id_map
+    assert ids and not state.in_flight
+    before = dict(service.objects)
+    posts = len(service.posted)
+    assert imp.run_zip_import(archive, service.api, tmp_path) == 2
+    code, rows = verify(archive)
+    assert code == 2 and any(field in row["mismatched_fields"] for row in rows)
+    different = False
+    assert imp.run_zip_import(archive, service.api, tmp_path) == 0
+    assert verify(archive, "repaired.jsonl")[0] == 0
+    assert len(service.posted) == posts and service.objects == before

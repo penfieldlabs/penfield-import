@@ -498,29 +498,29 @@ def _resume_vault_snapshot(vault, state, head, hashes, inventory, skip_dirs):
         raise ValueError("Cannot verify the saved Git commit; restore access to the original repository")
 
     new = hashes.keys() - state.source_hashes.keys()
-    legacy_paths = set()
-    if not state.git_inventory_checked:
-        legacy_paths = _git_regular_files(vault, pinned)
-        # Include already receipted paths: the old first import could have stored dirty bytes.
-        _verify_git_inventory(vault, pinned, legacy_paths, inventory, skip_dirs)
+    additions = []
+    if head != pinned:
+        additions = _git_new_files_since(vault, pinned, head, state.source_hashes)
+        if state.phase != "done" and any(_vault_path_eligible(Path(path), skip_dirs) for path in additions):
+            raise ValueError("Git inputs advanced during an incomplete restore; restore the pinned commit before retry")
+        if not state.git_inventory_checked and state.phase == "done":
+            _verify_git_inventory(vault, pinned, _git_regular_files(vault, pinned), inventory, skip_dirs)
 
-    if state.phase != "done" or pinned == head:
-        if new:
-            # An older baseline could have omitted a committed file. Only recover
-            # missing pinned inputs; a partial run cannot admit unrelated new work.
-            if not legacy_paths:
-                raise ValueError("Vault inputs changed since the checkpoint; restore the saved snapshot")
-            _verify_git_inventory(vault, pinned, legacy_paths, inventory, skip_dirs, new)
-        if head != pinned:
-            added = _git_new_files_since(vault, pinned, head, state.source_hashes)
-            if any(_vault_path_eligible(Path(path), skip_dirs) for path in added):
-                raise ValueError("Git inputs advanced during an incomplete restore; restore the pinned commit before retry")
-        return pinned
-
-    added = _git_new_files_since(vault, pinned, head, state.source_hashes)
-    paths = set(added) | legacy_paths
-    _verify_git_inventory(vault, head, paths, inventory, skip_dirs, new)
-    return head
+    # Eligibility depends on the file's contents. Plan from every in-scope tracked
+    # path, including previously protected notes and symlinks replaced by files.
+    # Also validate same-HEAD resumes: an older successful checkpoint may have
+    # omitted a newly eligible path. Recover it once its committed bytes are present.
+    target = head if state.phase == "done" else pinned
+    paths = _git_regular_files(vault, target)
+    if state.git_inventory_checked:
+        # Saved source hashes were compared above. The commit diff also guards
+        # those paths against edits hidden by a stale working copy.
+        paths.difference_update(state.source_hashes)
+        if target == head:
+            # A first import may have included an untracked path that has just been committed.
+            paths.update(additions)
+    _verify_git_inventory(vault, target, paths, inventory, skip_dirs, new)
+    return target
 
 
 def _git_text_checkout_is_crlf(vault_path: Path, path: str) -> bool:
@@ -675,6 +675,13 @@ class APIError(Exception):
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", request_id):
             request_id = None
         return cls(exc.code, body, url, headers.get("Retry-After"), request_id)
+
+
+class MemoryFieldMismatch(APIError):
+    def __init__(self, destination_id, fields, path):
+        self.destination_id = destination_id
+        self.fields = fields
+        super().__init__(0, "Memory readback differs in " + ", ".join(fields), path)
 
 
 # ---------------------------------------------------------------------------
@@ -908,17 +915,14 @@ class PenfieldClient:
         _acknowledge("memories", [memory_id])
         path = "/memories/" + urllib.parse.quote(memory_id, safe="")
         stored = self._readback(path)
-        for field, wanted in payload.items():
-            actual = stored.get(field)
-            if field == "tags":
-                wanted = sorted({normalize_tag(tag) for tag in wanted})
-                actual = sorted(actual) if isinstance(actual, list) else None
-            matches = (_source_object_matches(wanted, actual) if field == "metadata"
-                       else _json_values_equal(actual, wanted))
-            if not matches:
-                raise APIError(0, f"Memory readback differs in {field}", path)
         if stored.get("id") != memory_id:
             raise APIError(0, "Memory ID mismatch", path)
+        expected = dict(payload)
+        if tags is not None:
+            expected["tags"] = tags
+        differences = _memory_field_differences(expected, stored)
+        if differences:
+            raise MemoryFieldMismatch(memory_id, differences, path)
         return memory_id
 
     @staticmethod
@@ -1014,7 +1018,8 @@ class PenfieldClient:
                         or not metadata_matches):
                     raise APIError(0, "Document metadata readback mismatch", path)
                 self._verify_document_bytes(path, data)
-                return dict(receipt, id=doc_id, processing_status=stored.get("processing_status"),
+                return dict(receipt, id=doc_id, observed_content_type=media_type,
+                            processing_status=stored.get("processing_status"),
                             embedding_progress=stored.get("embedding_progress"))
             except urllib.error.HTTPError as e:
                 error = APIError.from_http(e, url)
@@ -2286,6 +2291,7 @@ class ZipCheckpoint:
     artifact_type_receipts: dict[str, str] = field(default_factory=dict)
     typed_metadata_v1: dict[str, str] = field(default_factory=dict)
     memory_field_receipts: dict[str, str] = field(default_factory=dict)
+    document_type_receipts: dict[str, str] = field(default_factory=dict)
     metadata_issues: dict[str, str] = field(default_factory=dict)
     relationship_id_map: dict[str, str] = field(default_factory=dict)
     relationship_receipt_checks: dict[str, str] = field(default_factory=dict)
@@ -2302,6 +2308,7 @@ class ZipCheckpoint:
             **{k: v for k, v in vars(self).items() if k != "write_keys" and (k != "relationship_traversal" or v)},
             "relationships_done": sorted(self.relationships_done),
             "checkpoint_version": 1,
+            "checked_memory_tags": True,
             "document_upload_errors_checked": True,
         }
 
@@ -2328,6 +2335,9 @@ class ZipCheckpoint:
                 if not all(isinstance(v, str) and v for v in value.values()):
                     raise ValueError(f"Invalid ZIP checkpoint mapping: {key}")
             setattr(checkpoint, key, value)
+        if data.get("checked_memory_tags") is not True:
+            # Older success receipts compared only nonempty tag lists.
+            checkpoint.memory_field_receipts.clear()
         if checkpoint.phase not in ZIP_PHASE_ORDER:
             raise ValueError("Invalid ZIP checkpoint phase")
         _check_old_document_failures(data)
@@ -2371,6 +2381,7 @@ class ZipCheckpoint:
                                  for key, dest in mapping.items() if not dest.startswith(SKIP_SENTINEL_PREFIX)}
         if (any(self.memory_id_map.get(key) != dest for key, dest in self.memory_field_receipts.items())
                 or any(metadata_destinations.get(key) != dest for key, dest in self.typed_metadata_v1.items())
+                or any(self.documents.get(key) != dest for key, dest in self.document_type_receipts.items())
                 or not self.metadata_issues.keys() <= metadata_destinations.keys()):
             raise ValueError("Inconsistent metadata verification receipts")
         if not (self.artifact_type_receipts.keys() <= self.artifacts.keys()
@@ -2654,7 +2665,8 @@ def run_zip_memories_phase(
         checkpoint.write_keys = [source_id]
         try:
             new_id = client.create_memory(**fields)
-            checkpoint.memory_field_receipts[source_id] = new_id
+            if "memories/" + source_id not in checkpoint.metadata_issues:
+                checkpoint.memory_field_receipts[source_id] = new_id
             if rec.get("metadata"):
                 checkpoint.typed_metadata_v1["memories/" + source_id] = new_id
             checkpoint.memory_id_map[source_id] = new_id
@@ -3112,7 +3124,9 @@ def _recheck_saved_fields(archive, client, checkpoint):
                 continue
             needs_metadata = expected and checkpoint.typed_metadata_v1.get(key) != dest
             needs_memory = section == "memories" and checkpoint.memory_field_receipts.get(row["id"]) != dest
-            if not (needs_metadata or needs_memory):
+            needs_type = (section == "documents" and row.get("mime_type") == "application/octet-stream"
+                          and checkpoint.document_type_receipts.get(row["id"]) != dest)
+            if not (needs_metadata or needs_memory or needs_type):
                 continue
             checked = True
             try:
@@ -3124,9 +3138,13 @@ def _recheck_saved_fields(archive, client, checkpoint):
                     differences = []
                     if stored.get("id") != dest:
                         differences.append("id")
-                    if not _source_object_matches(expected, stored.get("metadata")):
+                    if expected and not _source_object_matches(expected, stored.get("metadata")):
                         differences.append("metadata")
+                    if needs_type and (stored.get("content_type") or stored.get("mime_type")) != row["mime_type"]:
+                        differences.append("content_type")
                 if not differences:
+                    if needs_type:
+                        checkpoint.document_type_receipts[row["id"]] = dest
                     if expected:
                         checkpoint.typed_metadata_v1[key] = dest
                     if section == "memories":
@@ -3322,6 +3340,11 @@ def run_zip_documents_phase(
                 raise APIError(0, "Document upload returned no destination ID", "/documents/upload")
             if doc_metadata:
                 checkpoint.typed_metadata_v1["documents/" + source_id] = new_id
+            if rec.get("mime_type") == "application/octet-stream":
+                if result.get("observed_content_type") == rec["mime_type"]:
+                    checkpoint.document_type_receipts[source_id] = new_id
+                else:
+                    checkpoint.metadata_issues["documents/" + source_id] = "destination differs in content_type"
             checkpoint.documents[source_id] = new_id
             _record_zip_document_status(checkpoint, source_id, result)
         except APIError as e:
@@ -3444,6 +3467,12 @@ class _JournaledZipClient:
             try:
                 with _track_acknowledgement(self.checkpoint.in_flight, self.checkpoint, self.path):
                     result = method(*args, **kwargs)
+            except MemoryFieldMismatch as exc:
+                if name != "create_memory" or self.checkpoint.phase != "memories" or exc.fields != ["tags"]:
+                    raise
+                source_id, = self.checkpoint.write_keys
+                self.checkpoint.metadata_issues["memories/" + source_id] = exc.body
+                result = exc.destination_id
             except APIError as exc:
                 if exc.keep_write_intent(self.checkpoint.in_flight, self.checkpoint, self.path,
                                          document_upload=name == "upload_document_bytes"):

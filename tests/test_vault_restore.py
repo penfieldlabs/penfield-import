@@ -1,4 +1,5 @@
 """Regression cases at the vault CLI boundary. The destination is an in-memory stub."""
+import hashlib
 import subprocess
 import sys
 from unittest import mock
@@ -693,3 +694,63 @@ def test_incomplete_git_retry_stops_when_new_commit_changes_planned_inputs(monke
     assert run(monkeypatch, vault) == 1
     assert cp.read_bytes() == saved
     destination.create_memory.assert_not_called()
+
+
+@pytest.mark.parametrize("stale", ["protected", "missing"])
+@pytest.mark.parametrize("advanced", [False, True], ids=["increment", "old-completed-checkpoint"])
+def test_previously_protected_note_requires_committed_bytes(monkeypatch, vault, destination, stale, advanced):
+    _git_at(vault, "init")
+    note = vault / "changed.md"
+    protected = "---\ntype: identity_core\n---\nprivate"
+    note.write_text(protected)
+    (vault / "base.md").write_text("base")
+    _git_at(vault, "add", "changed.md", "base.md")
+    _git_at(vault, "commit", "-qm", "baseline")
+    assert run(monkeypatch, vault) == 0
+    cp = vault / importer.CHECKPOINT_FILENAME
+    note.write_text("ordinary")
+    sibling = vault / "sibling.md"
+    sibling.write_text("sibling")
+    _git_at(vault, "add", "changed.md", "sibling.md")
+    _git_at(vault, "commit", "-qm", "change eligibility and add sibling")
+    if advanced:
+        # R5b wrote the sibling and advanced its Git receipt with the old protected working copy.
+        state = importer.Checkpoint.load(cp)
+        state.commit_sha = _git_at(vault, "rev-parse", "HEAD")
+        state.source_hashes["sibling.md"] = hashlib.sha256(sibling.read_bytes()).hexdigest()
+        state.memories["sibling.md"] = "existing-sibling"
+        state.save(cp)
+    if stale == "protected":
+        note.write_text(protected)
+    else:
+        note.unlink()
+    before = cp.read_bytes()
+    for options in [("--dry-run",), (), ()]:
+        assert run(monkeypatch, vault, *options) == 1
+        assert cp.read_bytes() == before
+    assert destination.create_memory.call_count == 1
+    _git_at(vault, "restore", "changed.md")
+    assert run(monkeypatch, vault, "--dry-run") == 0
+    assert run(monkeypatch, vault) == 0
+    assert run(monkeypatch, vault) == 0
+    assert set(importer.Checkpoint.load(cp).memories) == {"base.md", "sibling.md", "changed.md"}
+    assert destination.create_memory.call_count == (2 if advanced else 3)
+
+
+def test_initially_untracked_file_must_match_its_first_git_blob(monkeypatch, vault, destination):
+    _git_at(vault, "init")
+    (vault / "tracked.md").write_text("base")
+    future = vault / "future.md"
+    future.write_text("working copy")
+    _git_at(vault, "add", "tracked.md")
+    _git_at(vault, "commit", "-qm", "initial")
+    assert run(monkeypatch, vault) == 0
+    before = (vault / importer.CHECKPOINT_FILENAME).read_bytes()
+    future.write_text("different committed copy")
+    _git_at(vault, "add", "future.md")
+    _git_at(vault, "commit", "-qm", "adopt formerly untracked input")
+    future.write_text("working copy")
+    assert run(monkeypatch, vault, "--dry-run") == 1
+    assert run(monkeypatch, vault) == 1
+    assert (vault / importer.CHECKPOINT_FILENAME).read_bytes() == before
+    assert destination.create_memory.call_count == 2

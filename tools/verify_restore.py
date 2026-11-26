@@ -47,7 +47,10 @@ def _different_fields(expected, actual):
         value = actual.get(key)
         if key == "tags":
             wanted = sorted({importer.normalize_tag(tag) for tag in wanted})
-            value = sorted(value) if isinstance(value, list) else ([] if value is None else value)
+            if isinstance(value, list) and all(isinstance(tag, str) for tag in value):
+                value = sorted(value)
+            elif value is None:
+                value = []
         elif key in {"metadata", "evidence"} and isinstance(wanted, dict):
             if not importer._source_object_matches(wanted, value):
                 different.append(key)
