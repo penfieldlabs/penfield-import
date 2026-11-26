@@ -421,8 +421,9 @@ def _git_head_sha(vault_path: Path) -> Optional[str]:
         if result.returncode == 0:
             return result.stdout.strip()
         inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=vault_path,
-                                capture_output=True, text=True, timeout=10)
-        if inside.stdout.strip() == "true" or os.path.lexists(vault_path / ".git"):
+                                capture_output=True, text=True, timeout=10, env={**os.environ, "LC_ALL": "C"})
+        outside = inside.returncode != 0 and "not a git repository" in inside.stderr
+        if not outside or os.path.lexists(vault_path / ".git"):
             raise ValueError("Cannot verify Git HEAD for this vault; check its committed snapshot")
     except FileNotFoundError:
         if any(os.path.lexists(folder / ".git") for folder in (vault_path, *vault_path.parents)):
