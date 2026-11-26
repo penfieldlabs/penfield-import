@@ -416,17 +416,17 @@ def _git_head_sha(vault_path: Path) -> Optional[str]:
     """Return the current HEAD commit SHA of the git repo containing *vault_path*,
     or ``None`` if the path is not inside a git repository."""
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
-            capture_output=True, text=True, timeout=10,
-            cwd=str(vault_path),
-        )
+        result = subprocess.run(["git", "rev-parse", "--verify", "HEAD^{commit}"], cwd=vault_path,
+                                capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    if any(os.path.lexists(folder / ".git") for folder in (vault_path, *vault_path.parents)):
-        raise ValueError("Cannot verify Git HEAD for this vault; check Git availability and its committed snapshot")
+        inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=vault_path,
+                                capture_output=True, text=True, timeout=10)
+        if inside.stdout.strip() == "true" or os.path.lexists(vault_path / ".git"):
+            raise ValueError("Cannot verify Git HEAD for this vault; check its committed snapshot")
+    except FileNotFoundError:
+        if any(os.path.lexists(folder / ".git") for folder in (vault_path, *vault_path.parents)):
+            raise ValueError("Git is required to verify this vault's committed snapshot")
     return None
 
 
