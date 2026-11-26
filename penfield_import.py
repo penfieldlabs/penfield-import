@@ -3642,7 +3642,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="INPUT_PATH",
-        help="Path to a Penfield export .zip file or a directory of .md/.txt files",
+        help="Path to a Penfield export ZIP or a vault of Markdown and text files",
     )
     parser.add_argument(
         "--base-url",
@@ -3653,7 +3653,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint-dir",
         type=Path,
         default=None,
-        help="Directory for checkpoint and report files (default: vault_path)",
+        help="Checkpoint directory (defaults to the vault root or the directory containing the ZIP)",
     )
     parser.add_argument(
         "--llm",
@@ -3708,13 +3708,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         default=False,
-        help="Parse vault and show stats without making any API calls",
+        help="Preview the ZIP or vault locally without changing checkpoints or calling the API",
     )
     parser.add_argument(
         "--reset",
         action="store_true",
         default=False,
-        help="Delete checkpoint file before starting",
+        help="Start with fresh local tracking after validation. A dry run preserves existing state",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -3740,7 +3740,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--logout",
         action="store_true",
         default=False,
-        help="Unconditionally clear all cached OAuth tokens, then exit",
+        help="Clear the cached OAuth grant for the selected API origin, then exit",
     )
     auth_group.add_argument(
         "--auth-status",

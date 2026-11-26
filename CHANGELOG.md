@@ -6,18 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [2.0.1] - Unreleased
 
-- Check incremental Git additions against committed content and treat same-note heading links as local navigation.
-- Remap explicit context-description references in dependency order and name cyclic or missing references in preview and verification.
-- Distinguish JSON booleans from numbers in write-time comparisons, verify the ownership of shared destination IDs and use API defaults for null optional relationship fields.
+### Fixed
 
-- Validate ZIP records and payloads before writing. Restore nested contexts in dependency order and report unresolved membership.
-- Bind recovery to input and destination, journal writes, lock state and return a failing status for incomplete restores. Preserve recovery state during preview.
-- Read back memory and relationship fields, artifact content and document bytes. Separate identical existing objects from conflicting ones.
-- Fix vault parsing, incremental discovery, duplicate note names and oversized note preservation.
-- Honor the destination environment setting, isolate cached grants, verify refreshed credentials and restrict credentialed redirects.
-- Fix the build backend requirement and source distribution test collection.
-- Add a standalone dev content reset tool with recursive artifact discovery, paginated inventories, tenant verification and post-delete checks.
-- Preserve returned destination IDs during write verification. Verify context metadata and original document downloads, report omitted document tags, and distinguish pending or failed vectors from verified bytes.
+- Validate the entire ZIP before writes, including record identities, graph references and payload files. Preview preserves checkpoints, including when combined with `--reset`.
+- Bind ZIP recovery to the archive digest and destination identity. Keep uncertain creates journaled, retry definite failures and report an incomplete restore with a nonzero exit.
+- Verify memory fields, relationship evidence, context membership and descriptions, artifact contents and document downloads. Report conflicting objects, unverifiable fields, omitted tags and incomplete context references per source record.
+- Resolve nested contexts and case-variant UUID references. Reject self-relationships in ZIP preflight. Identify cycles and missing references during preview. Use API defaults for null optional direction, strength and confidence.
+- Check older receipts for incorrect memory fields, JSON type mismatches and conflicting destination IDs. Compare a declared artifact media type on readback and retain partial results on repeat.
+- Check committed Git inputs before the first vault import, before resuming older checkpoints and before advancing to a newer commit. A missing or edited tracked input stops the run before sibling writes.
+- Preserve original oversized notes under distinct paths. Recheck planned vault artifacts before upload. Exclude Markdown code examples and same-note navigation from graph edges. Handle Unicode paths, attachment-only additions and ambiguous note names.
+- Preserve evidence of uncertain document uploads, including HTTP 400 when extraction may already have created a failed document. Guard retries from older checkpoints with a document failure and no receipt. Track chunk indexing separately from verified original bytes.
+- Honor `PENFIELD_BASE_URL`, isolate cached grants by origin, verify the destination on token renewal and restrict credentialed redirects. Raise the minimum build backend to setuptools 61 and include the test collection configuration in source distributions.
+
+### Added
+
+- A read-only ZIP verifier that produces one JSONL result per source record.
+- A dev-only content reset helper with recursive artifact discovery, paginated inventories, tenant verification and a post-delete read for every ID or path.
+- The README in the wheel's package description and the changelog, release notes and environment example in the source distribution.
 
 ## [2.0.0] - 2026-06-03
 
