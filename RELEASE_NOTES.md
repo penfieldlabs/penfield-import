@@ -6,6 +6,8 @@ The first 2.0.1 review build, `675da708`, could accept stale context references 
 
 Incremental Git imports check new notes, artifacts and documents against the selected commit before sending them. Same-note heading and block links remain in the original text. Preview lists contexts blocked by a cycle and the source rows involved. Nullable optional edge fields use the API defaults.
 
+R2 (`d4d14e1`) could advance past a missing committed file, record a skipped vault artifact as uploaded and trust an incorrect older edge receipt. This revision checks the complete eligible Git additions, hashes the artifact bytes used for upload and compares legacy edge receipts with a fresh destination read. A completed edge without an ID requires reconciliation. Markdown code examples no longer create graph edges. UUIDs in graph references resolve regardless of letter case.
+
 ## Restoring with the candidate
 
 1. Create a virtual environment and install the package as described in the README.

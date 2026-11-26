@@ -122,6 +122,7 @@ def test_max_length_trait_downgrade_retains_entire_text(tmp_path):
 def test_relationship_evidence_reaches_write_payload(tmp_path):
     cp = importer.ZipCheckpoint(memory_id_map={"a": "new-a", "b": "new-b"})
     api = Mock()
+    api.create_relationships_bulk.return_value = {"verified_ids": ["edge-1"]}
     evidence = "Source passage supporting this edge."
     with make_zip(relationships=[{
         "id": "r", "from_id": "a", "to_id": "b", "relationship_type": "supports", "evidence": evidence,

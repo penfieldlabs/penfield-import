@@ -75,7 +75,7 @@ def _memory(record, stored, dest, result):
 
 
 def _context(record, stored, dest, mapped, checkpoint, source_ids, aliases, result):
-    original = record.get("memory_ids") or []
+    original = importer._member_ids(record, aliases)
     members = [mapped[mid] for mid in original if mid in mapped]
     missing = [mid for mid in original if mid not in mapped]
     description = MEMBER_TOKEN.sub(
@@ -115,8 +115,8 @@ def _context(record, stored, dest, mapped, checkpoint, source_ids, aliases, resu
         result["outcome"] = "partial_source"
 
 
-def _edge(record, stored, dest, mapped, result):
-    expected = {"id": dest, "from_id": mapped.get(record["from_id"]), "to_id": mapped.get(record["to_id"]),
+def _edge(record, stored, dest, mapped, result, aliases):
+    expected = {"id": dest, "from_id": mapped.get(importer._source_reference(record["from_id"], aliases)), "to_id": mapped.get(importer._source_reference(record["to_id"], aliases)),
                 "relationship_type": record["relationship_type"], "metadata": record.get("metadata") or {}}
     for key in ("direction_type", "strength", "confidence", "inverse_type", "evidence"):
         if record.get(key) is not None:
@@ -211,7 +211,7 @@ def _verify_rows(archive, checkpoint, keys, client, stream):
                         if key in cycle_blocked:
                             result["reason"] = "blocked_by_context_cycle"
                         result["missing_members"] = [
-                            mid for mid in (record.get("memory_ids") or []) if mid not in mapped
+                            mid for mid in importer._member_ids(record, aliases) if mid not in mapped
                         ]
                         result["missing_description_references"] = [
                             mid for mid in importer._description_ids(record, aliases) if mid not in mapped
@@ -227,7 +227,7 @@ def _verify_rows(archive, checkpoint, keys, client, stream):
                         _context(record, stored, dest, mapped, checkpoint, source_ids, aliases, result)
                 elif section == "relationships":
                     result["destination_id"] = dest
-                    _edge(record, _get(client, "/relationships/" + quote(dest, safe="")), dest, mapped, result)
+                    _edge(record, _get(client, "/relationships/" + quote(dest, safe="")), dest, mapped, result, aliases)
                 elif section == "artifacts":
                     stored = _get(client, "/artifacts?" + urlencode({"path": dest}))
                     _artifact(archive, record, stored, dest, result)

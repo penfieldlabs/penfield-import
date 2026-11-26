@@ -225,3 +225,27 @@ def test_vault_rejects_reused_document_id_and_preserves_intent(tmp_path):
     assert len(saved.documents) == 1 and saved.pending_write["kind"] == "document"
     with pytest.raises(ValueError, match="repeated document"):
         imp.Checkpoint.from_dict({"documents": {"one.txt": "D", "two.txt": "D"}})
+
+
+@pytest.mark.parametrize("legacy", ["incorrect_evidence", "missing_id", "correct"])
+def test_legacy_relationship_receipt_requires_destination_readback(tmp_path, monkeypatch, legacy):
+    service = Service(monkeypatch)
+    archive = archive_with(tmp_path, relationships=[edge(evidence={"confirmed": 1})])
+    assert imp.run_zip_import(archive, service.api) == 0
+    path = tmp_path / imp.ZIP_CHECKPOINT_FILENAME
+    data = json.loads(path.read_text())
+    data.pop("relationship_receipt_checks", None)
+    if legacy == "incorrect_evidence":
+        service.objects["/relationships/R"]["evidence"] = {"confirmed": True}
+        data["identical_relationships"] = ["e"]
+    elif legacy == "missing_id":
+        data["relationship_id_map"] = {}
+    path.write_text(json.dumps(data))
+    writes = len(service.posted)
+    expected = 0 if legacy == "correct" else 2
+    for attempt in range(2):
+        assert imp.run_zip_import(archive, service.api) == expected
+        assert verify(archive, f"audit-{attempt}.jsonl")[0] == expected
+    assert len(service.posted) == writes
+    if legacy == "correct":
+        assert imp.ZipCheckpoint.load(path).relationship_receipt_checks["e"] == "typed-v1"

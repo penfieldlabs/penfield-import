@@ -2318,7 +2318,7 @@ class TestZipRelationshipsPhase:
         }]
         data = _make_export_zip(relationships=rels)
         client = mock.MagicMock(spec=vtp.PenfieldClient)
-        client.create_relationships_bulk.return_value = {}
+        client.create_relationships_bulk.return_value = {"verified_ids": ["edge-1"]}
         cp = vtp.ZipCheckpoint()
         cp.memory_id_map = {"old-a": "new-a", "old-b": "new-b"}
         cp_path = tmp_path / "cp.json"
@@ -2703,7 +2703,7 @@ class TestZipImportEndToEnd:
         client = mock.MagicMock(spec=vtp.PenfieldClient)
         client.destination_identity.return_value = "test-destination"
         client.create_memory.side_effect = mock_create_memory
-        client.create_relationships_bulk.return_value = {}
+        client.create_relationships_bulk.return_value = {"verified_ids": ["edge-1"]}
         client.create_artifact.return_value = {}
         client.get_memory_count.return_value = 2
 

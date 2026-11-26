@@ -456,3 +456,98 @@ def test_legacy_unconfirmed_heading_write_stops_before_receipt_migration(monkeyp
     assert "unconfirmed write" in caplog.text and path.read_bytes() == before
     destination.create_memory.assert_called_once()
     destination.create_relationships_bulk.assert_not_called()
+
+
+@pytest.mark.parametrize("missing", ["two.md", "Artifacts/two.txt", "Documents/two.csv"])
+@pytest.mark.parametrize("sibling", [False, True])
+def test_missing_committed_addition_blocks_before_writes(monkeypatch, vault, destination, missing, sibling):
+    destination.upload_document_bytes.return_value = {"id": "doc", "processing_status": "completed"}
+    _git_at(vault, "init")
+    (vault / "base.md").write_text("base")
+    _git_at(vault, "add", "base.md")
+    _git_at(vault, "commit", "-qm", "base")
+    assert run(monkeypatch, vault) == 0
+    cp = vault / importer.CHECKPOINT_FILENAME
+    baseline = cp.read_bytes()
+    path = vault / missing
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("two")
+    _git_at(vault, "add", missing)
+    if sibling:
+        (vault / "one.md").write_text("one")
+        _git_at(vault, "add", "one.md")
+    _git_at(vault, "commit", "-qm", "addition")
+    path.unlink()
+    assert run(monkeypatch, vault) == 1
+    assert cp.read_bytes() == baseline
+    assert destination.create_memory.call_count == 1
+    destination.create_artifact.assert_not_called()
+    destination.upload_document_bytes.assert_not_called()
+    _git_at(vault, "restore", "--", missing)
+    assert run(monkeypatch, vault) == 0
+    assert run(monkeypatch, vault) == 0
+    assert missing in importer.Checkpoint.load(cp).source_hashes
+
+
+def test_artifact_changed_after_preflight_and_legacy_binary_receipt(monkeypatch, vault, destination):
+    path = vault / "Artifacts" / "a.txt"
+    path.parent.mkdir()
+    path.write_bytes(b"original")
+    cp = vault / importer.CHECKPOINT_FILENAME
+    original_phase = importer.run_vault_artifacts_phase
+
+    def replace(*args):
+        path.write_bytes(b"\0binary")
+        original_phase(*args)
+
+    monkeypatch.setattr(importer, "run_vault_artifacts_phase", replace)
+    assert run(monkeypatch, vault) == 1
+    assert not importer.Checkpoint.load(cp).vault_artifacts
+    destination.create_artifact.assert_not_called()
+    path.write_bytes(b"original")
+    monkeypatch.setattr(importer, "run_vault_artifacts_phase", original_phase)
+    legacy = importer.Checkpoint.load(cp)
+    legacy.phase = "done"
+    legacy.vault_artifacts["a.txt"] = importer.SKIP_BINARY
+    legacy.save(cp)
+    assert run(monkeypatch, vault) == 0
+    assert run(monkeypatch, vault) == 0
+    destination.create_artifact.assert_called_once_with("/a.txt", "original")
+    assert importer.Checkpoint.load(cp).vault_artifacts == {"a.txt": "/a.txt"}
+
+
+def test_markdown_code_examples_do_not_create_or_block_edges(monkeypatch, vault, destination):
+    source = ("[[real]]\n\n```txt\n[[example]]\n```\n\n> ~~~\n> [[unknown]]\n> ~~~\n\n"
+              "Use ``a ` [[unknown]]`` and `x\n[[example]]`.\n")
+    for name, content in [("guide", source), ("real", "target"), ("example", "example")]:
+        (vault / (name + ".md")).write_text(content)
+    options = ("--relationships", "inline")
+    assert run(monkeypatch, vault, *options, "--dry-run") == 0
+    assert run(monkeypatch, vault, *options) == 0
+    assert run(monkeypatch, vault, *options) == 0
+    assert importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME).relationships_done == {"guide.md|real.md|references"}
+    assert destination.create_memory.call_args_list[1].kwargs["content"] == source
+
+
+def test_upgrade_recovers_file_omitted_from_completed_git_checkpoint(monkeypatch, vault, destination):
+    _git_at(vault, "init")
+    (vault / "base.md").write_text("base")
+    _git_at(vault, "add", "base.md")
+    _git_at(vault, "commit", "-qm", "base")
+    assert run(monkeypatch, vault) == 0
+    cp = vault / importer.CHECKPOINT_FILENAME
+    missed = vault / "missed.md"
+    missed.write_text("committed")
+    _git_at(vault, "add", "missed.md")
+    _git_at(vault, "commit", "-qm", "missed")
+    old = importer.Checkpoint.load(cp)
+    old.git_inventory_checked = False
+    old.commit_sha = _git_at(vault, "rev-parse", "HEAD")
+    old.save(cp)
+    missed.unlink()
+    assert run(monkeypatch, vault) == 1
+    _git_at(vault, "restore", "missed.md")
+    assert run(monkeypatch, vault) == 0
+    assert run(monkeypatch, vault) == 0
+    assert destination.create_memory.call_count == 2
+    assert importer.Checkpoint.load(cp).memories.keys() == {"base.md", "missed.md"}

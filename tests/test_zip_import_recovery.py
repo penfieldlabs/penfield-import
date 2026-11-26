@@ -23,6 +23,7 @@ def export(tmp_path, filename="export.zip", **sections):
 
 def client():
     result = Mock(spec=importer.PenfieldClient)
+    result.create_relationships_bulk.return_value = {"verified_ids": ["edge-1"]}
     result.destination_identity.return_value = "test-target"
     result.create_memory.side_effect = lambda **kwargs: "dest-" + kwargs["content"]
     return result
@@ -154,7 +155,7 @@ def test_semantically_rejected_edge_does_not_discard_the_rest(tmp_path):
     def reject_invalid(edges):
         if any(edge["relationship_type"] == "bad" for edge in edges):
             raise importer.APIError(422, "reject", "/relationships/bulk")
-        return {}
+        return {"verified_ids": ["edge-1"]}
     api.create_relationships_bulk.side_effect = reject_invalid
     assert importer.run_zip_import(archive, api) == 2
     cp = importer.ZipCheckpoint.load(tmp_path / importer.ZIP_CHECKPOINT_FILENAME)
@@ -306,3 +307,46 @@ def test_traversal_comparison_distinguishes_json_booleans_from_numbers():
     wanted = {"traversal_properties": {"rules": [True, {"threshold": 2}]}}
     assert importer._traversal_status(wanted, {"traversal_properties": {"rules": [1, {"threshold": 2}]}}) == "mismatch"
     assert importer._traversal_status(wanted, {"traversal_properties": {"rules": [True, {"threshold": 2.0}]}}) == "matched"
+
+
+def test_uppercase_uuid_references_across_sections(tmp_path, capsys):
+    mid = "12345678-abcd-4321-8765-123456789abc"
+    cid = "22345678-abcd-4321-8765-123456789abc"
+    archive = export(tmp_path, memories=[{"id": mid, "content": "text"}],
+                     contexts=[{"id": cid, "name": "ctx", "memory_ids": [mid.upper()],
+                                "description": "memory_id: " + mid.upper()}],
+                     relationships=[{"id": "r", "from_id": mid.upper(), "to_id": cid.upper(), "relationship_type": "supports"}])
+    api = client()
+    api.create_memory.side_effect = ["memory-id", "context-id"]
+    assert importer.run_zip_import(archive, None, dry_run=True) == 0
+    preview = capsys.readouterr().out
+    assert "0 absent from export" in preview and "unavailable endpoint" not in preview
+    assert importer.run_zip_import(archive, api) == 0
+    content = json.loads(api.create_memory.call_args.kwargs["content"])
+    assert content["memory_ids"] == ["memory-id"] and content["description"] == "memory_id: memory-id"
+    assert api.create_relationships_bulk.call_args.args[0][0]["to_id"] == "context-id"
+    assert importer.run_zip_import(archive, api) == 0
+    assert api.create_memory.call_count == 2 and api.create_relationships_bulk.call_count == 1
+
+
+@pytest.mark.parametrize("receipt", [{}, {"verified_ids": []}, {"verified_ids": [None]}, {"verified_ids": ["__skipped__"]}])
+def test_zip_write_missing_relationship_receipt_prevents_replay(tmp_path, receipt):
+    archive = export(tmp_path, memories=[{"id": "a", "content": "a"}, {"id": "b", "content": "b"}],
+                     relationships=[{"id": "edge", "from_id": "a", "to_id": "b", "relationship_type": "supports"}])
+    api = client()
+    api.create_relationships_bulk.return_value = receipt
+    assert importer.run_zip_import(archive, api) == 1
+    state = importer.ZipCheckpoint.load(tmp_path / importer.ZIP_CHECKPOINT_FILENAME)
+    assert state.in_flight["source_keys"] == ["edge"] and not state.relationships_done
+    assert importer.run_zip_import(archive, api) == 1
+    api.create_relationships_bulk.assert_called_once()
+
+
+def test_case_colliding_uuid_keys_rejected_before_writes(tmp_path):
+    uid = "12345678-abcd-4321-8765-123456789abc"
+    archive = export(tmp_path, memories=[{"id": uid.upper(), "content": "text"}],
+                     contexts=[{"id": uid, "name": "context"}])
+    api = client()
+    assert importer.run_zip_import(archive, None, dry_run=True) == 1
+    assert importer.run_zip_import(archive, api) == 1
+    api.destination_identity.assert_not_called()

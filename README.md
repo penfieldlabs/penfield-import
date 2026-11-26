@@ -29,12 +29,12 @@ penfield-import /path/to/export.zip --checkpoint-dir /tmp/import-state
 Preview reads the archive locally. It checks the manifest and JSONL rows, record identities and referenced payloads. The manifest and each JSONL row are limited to 16 MiB. Review the counts, protected types, and unresolved references in context memberships and descriptions before choosing a destination. Use a different checkpoint directory for each archive and destination.
 
 1. **Memories.** The importer creates ordinary memories with their supported metadata. It excludes protected `identity_core` records and converts `personality_trait` to `fact`. The attribution prefix is added only when it fits.
-2. **Contexts.** Saved contexts become checkpoint memories. The checkpoint name and restored member count are verified in the stored JSON content. The memory metadata preserves fields from the export’s `checkpoint_metadata` object. Members can point to ordinary memories or other contexts, including later rows. The importer resolves these dependencies and preserves membership order. An absent member, a dependency cycle or a destination conflict remains visible in the result.
+2. **Contexts.** Saved contexts become checkpoint memories. The checkpoint name and restored member count are verified in the stored JSON content. The memory metadata preserves fields from the export’s `checkpoint_metadata` object. Members can point to ordinary memories or other contexts, including later rows. UUID references in descriptions, memberships and relationship endpoints accept either case. The importer resolves these dependencies and preserves membership order. An absent member, a dependency cycle or a destination conflict remains visible in the result.
 3. **Relationships.** The importer remaps endpoints and submits batches of up to 100. A definite batch validation rejection can be isolated to the offending row. The importer forwards nonempty `traversal_properties` objects and compares them on readback. If the API omits the field or returns different properties, the checkpoint retains the edge ID and records the source row as partial. A rerun reads that edge again without recreating it. An existing edge qualifies as identical only after its supplied properties match. [Relationship API](https://docs.penfield.app/api/endpoints/relationships/)
 4. **Artifacts.** UTF-8 text up to 1 MiB is eligible. Occupied paths require matching destination content. Different bytes at the same path are a conflict. Binary artifacts require a separate preservation decision.
 5. **Documents.** Eligible originals up to 20 MiB are sent with their metadata. The importer checks the returned ID and downloads the original bytes for comparison. Indexing is asynchronous. The report distinguishes verified original bytes from pending, ready, unknown or failed chunk indexing. A rerun refreshes unresolved indexing by document ID. Failed chunks result in an incomplete restore even when the top-level status says completed.
 
-Successful writes receive a destination readback. A subsequent no-op uses the checkpoint's prior receipts. It does not scan for objects that somebody later edited or deleted.
+Successful writes receive a destination readback. Each completed ZIP relationship needs a destination ID. On upgrade, the importer reads older relationship receipts and compares the stored edge to the source, including JSON types in metadata and evidence. A mismatch stays incomplete on retry. A subsequent no-op uses the checkpoint's verified receipts. It does not scan for objects that somebody later edited or deleted.
 
 ### Verify a restored ZIP against the destination
 
@@ -208,7 +208,7 @@ For a much richer import, add typed relationships before importing. Two approach
 
 **Option B: LLM pre-processing** - Use Claude Code, Cursor, or any LLM with access to your files to analyze your notes and add typed relationship frontmatter before running the import. Point the LLM at the [SKILL.md](https://github.com/penfieldlabs/obsidian-wikilink-types/blob/main/SKILL.md) for the relationship type definitions and ask it to add appropriate frontmatter links. This works on any `.md` or `.txt` collection, not just Obsidian vaults.
 
-**Option C: Inline wikilinks** - If your notes already have `[[wikilinks]]` in the body text (standard Obsidian practice), use `--relationships inline` to import them as `references` relationships. No frontmatter needed.
+**Option C: Inline wikilinks** - If your notes already have `[[wikilinks]]` in the body text (standard Obsidian practice), use `--relationships inline` to import them as `references` relationships. Inline code and fenced code examples stay in the note text and create no relationships.
 
 ### Relationship modes (`--relationships`)
 
@@ -356,6 +356,7 @@ python penfield_import.py /path/to/vault
 python penfield_import.py /path/to/vault
 ```
 
+- Missing eligible committed files stop the entire increment before any destination write. Restore them from the commit and retry with the same checkpoint. Vault artifacts are hashed again immediately before upload.
 - Incremental imports compare each new note, artifact and document with its Git blob at the recorded commit. Text files may use CRLF working-copy line endings for an LF blob. Other differences stop the run before any writes. Commit the edit or restore the committed content before retrying. Changes to previously imported inputs require reconciliation with the destination.
 - The checkpoint stores the full `{rel_path: memory_id}` map from all prior runs, so relationships from new notes to existing notes resolve correctly.
 - For non-Git vaults, repeating a completed import checks the source snapshot and destination identity. A changed snapshot requires a separate restore decision.
@@ -394,6 +395,7 @@ The LLM client has independent retry logic.
 ## Requirements
 
 - Python 3.9+
+- The installed Markdown parser, markdown-it-py, identifies prose wikilinks.
 - [PyYAML](https://pypi.org/project/PyYAML/) (installed automatically via `pip install .`)
 
 > **Note:** PyYAML follows the YAML 1.1 spec, which treats `yes`, `no`, `on`, `off` as booleans. If your frontmatter contains these as literal string values, they will be parsed as `True`/`False`. This is standard PyYAML behavior, not a bug in this tool. Use quoted strings (`"yes"`, `"no"`) in your YAML if you need them as literal values.
