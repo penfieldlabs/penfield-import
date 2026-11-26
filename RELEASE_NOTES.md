@@ -1,40 +1,36 @@
-# Penfield Import v2.0.0
+# Penfield Import 2.0.1
 
-Import Penfield portal exports or Obsidian vaults into [Penfield](https://penfield.app).
+Version 2.0.0 could exit successfully after a rejected write and could skip data when reusing a checkpoint. Version 2.0.1 validates input before writing, binds checkpoints to the input and destination, verifies stored records, and reports partial restores so operators can recover without duplicating successful writes. If you restored with 2.0.0, keep the original archives and all existing checkpoints when investigating that restore.
 
-## What's new in v2.0.0
+## Changes for operators
 
-- **ZIP/JSONL import** — Penfield portal exports (v1 ZIP archives) can now be imported directly. The tool validates the manifest, processes all five JSONL data files in phase order (memories → relationships → contexts → artifacts → documents), and checkpoints after each record for crash safety.
-- **Protected type handling** — `identity_core` memories are skipped (the API does not allow creation). `personality_trait` memories are downgraded to `fact` with a prefix note.
-- **Context reconstruction** — Exported contexts are recreated as `checkpoint` memories via the memories API, preserving checkpoint names and remapped memory references.
-- **Binary artifact detection** — Artifacts with null bytes in the first 8 KB are correctly uploaded as binary instead of being misidentified as UTF-8 text.
-- **Artifact size validation** — Artifacts exceeding the 1 MB API limit are skipped with a warning and checkpointed so they are never re-attempted on resume.
-- **Ambiguous filename collision fix** — Vault imports with duplicate filenames across directories now skip ambiguous relationship targets with a warning instead of resolving them arbitrarily.
-- **Extended memory creation** — `memory_type`, `importance`, `confidence`, `source_type`, and `metadata` are now passed through to the API when present in export data.
+- Run a local preview before the first write. It reads the ZIP or vault and reports supported transformations and graph problems. A ZIP preview can succeed while reporting partial work that a restore will surface.
+- Keep the checkpoint when a restore stops. It binds receipts to the source and destination and records uncertain writes. A normal retry preserves confirmed successes.
+- A document upload can return HTTP 400 after creating a failed server record. Inspect the destination before any replay. A successful upload may still have pending vector indexing.
+- Git vault imports enumerate and check every committed path within the selected vault before writing siblings or advancing the checkpoint. Preview and the saved checkpoint identify each excluded path and reason. If a previously imported path was edited, deleted or renamed, reconcile its destination record.
 
-## Fields not preserved on round-trip
+## Restoring with 2.0.1
 
-The following fields are present in exports but assigned server-side and cannot be set via the API:
+1. Create a virtual environment and install the package from the source root. Follow the installation and authentication instructions in the [README](README.md).
+2. Run `penfield-import INPUT --dry-run`. Review protected types, graph references and unsupported data. Preview makes no API calls or checkpoint changes.
+3. Choose the destination explicitly with `--base-url` or export `PENFIELD_BASE_URL`. Use a dedicated checkpoint directory per input and destination. Production users can sign in with the device code or use a production API key.
+4. Run the import and retain its output and checkpoint. A partial ZIP returns 2. A stopped ZIP or incomplete vault returns nonzero. A protected identity exclusion is reported separately.
+5. Retry a definite rejection using the same input, destination and state. If a write has an uncertain outcome, inspect its source keys and compare the destination before any replay. A fresh checkpoint can create duplicates.
 
-- Timestamps (`created_at`, `updated_at`) on memories, relationships, and documents
-- Ownership (`user_id` on memories, `created_by` on relationships, `uploaded_by` on documents)
-- `is_auto_detected` on relationships
+## Compatibility and verification
 
-## Authentication
+Version 2.0.1 refuses automatic reuse of older, unbound ledgers. An existing 2.0.0 success summary is insufficient evidence of completeness. Compare mapped records and source payloads against the destination, especially artifact collisions, skipped or failed relationships and saved context membership. Use separate destination state for any fresh test restore. The bundled verifier requires a checkpoint bound to a source digest and a verified destination. A 2.0.0 checkpoint alone cannot establish either. Preserve the old ledger and check its mapped objects separately.
 
-Two options:
-- **OAuth device code flow** (recommended) — `penfield-import --login` opens a browser for authorization. Tokens are cached and refreshed automatically.
-- **API key** — set `PENFIELD_API_KEY` environment variable. The key is exchanged for a short-lived token before any requests.
+At write time, the client reads back accepted memories and edges, compares text artifacts and checks original document bytes. Processing and embedding completion are separate from byte verification. Service-managed fields, protected memory types and binary artifacts have the preservation limits described in the README. A no-op resume relies on the saved receipts.
 
-## Crash safety
+Context verification checks the name and member count in the checkpoint content and preserves caller-supplied checkpoint metadata. Document downloads use the same client identity header as uploads. The report checks chunk-level embedding progress, retains pending outcomes for a later status refresh, and identifies document tags the API cannot store.
 
-Every operation is checkpointed. If the import is interrupted, re-run the same command and it picks up where it left off. ZIP and vault imports use separate checkpoint files so they don't interfere.
+The source distribution includes the dev-only content reset helper. It inventories inactive memories, relationships, documents and recursive artifact paths. After an authorized reset it checks each original ID or path for HTTP 404 and enumerates the destination again. Usage and required scopes appear in the README.
 
-## Requirements
+## Recovering a nested vault after a Git error
 
-- Python 3.9+
-- [PyYAML](https://pypi.org/project/PyYAML/) (installed automatically via `pip install .`)
+Version 2.0.1 checks enclosing repository markers before accepting plain-directory mode. Preview, import and reset stop when a nested vault's enclosing repository cannot be verified.
 
-## License
+Repair the repository first. From the vault directory, check `git rev-parse --show-toplevel` and `git rev-parse --verify HEAD`. Confirm the intended commit, restore missing tracked inputs and rerun preview and import using the original checkpoint and destination. A matching earlier receipt is retained. A changed previously restored file requires reconciliation.
 
-AGPL-3.0
+The full list of changes is in the [CHANGELOG](CHANGELOG.md).
