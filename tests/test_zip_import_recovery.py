@@ -350,3 +350,14 @@ def test_case_colliding_uuid_keys_rejected_before_writes(tmp_path):
     assert importer.run_zip_import(archive, None, dry_run=True) == 1
     assert importer.run_zip_import(archive, api) == 1
     api.destination_identity.assert_not_called()
+
+
+def test_case_variant_self_edge_fails_before_auth(tmp_path):
+    mid = "a2345678-abcd-4321-8765-123456789abc"
+    archive = export(tmp_path, memories=[{"id": mid, "content": "a"}],
+                     relationships=[{"id": "e", "from_id": mid, "to_id": mid.upper(), "relationship_type": "supports"}])
+    api = client()
+    assert importer.run_zip_import(archive, None, dry_run=True) == 1
+    assert importer.run_zip_import(archive, api) == 1
+    api.destination_identity.assert_not_called()
+    assert not (tmp_path / importer.ZIP_CHECKPOINT_FILENAME).exists()

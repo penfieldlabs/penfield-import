@@ -595,3 +595,101 @@ def test_vault_duplicate_note_id_keeps_pending_write(monkeypatch, vault, destina
     assert destination.create_memory.call_count == 2
     with pytest.raises(ValueError, match="repeated memory destination"):
         importer.Checkpoint.from_dict({"memories": {"a.md": "shared", "b.md": "shared"}})
+
+
+@pytest.mark.parametrize("path", ["first.md", "Artifacts/first.txt", "Documents/first.csv"])
+@pytest.mark.parametrize("change", ["edit", "delete", "rename"])
+def test_git_increment_checks_committed_changes_even_with_old_working_bytes(monkeypatch, vault, destination, path, change):
+    destination.upload_document_bytes.return_value = {"id": "doc", "processing_status": "completed"}
+    first = vault / path
+    first.parent.mkdir(exist_ok=True)
+    first.write_text("first edition")
+    _git_at(vault, "init")
+    _git_at(vault, "add", ".")
+    _git_at(vault, "commit", "-qm", "first snapshot")
+    assert run(monkeypatch, vault) == 0
+    checkpoint = vault / importer.CHECKPOINT_FILENAME
+    baseline = checkpoint.read_bytes()
+    destination.reset_mock()
+    if change == "edit":
+        first.write_text("second edition")
+    elif change == "delete":
+        first.unlink()
+    else:
+        first.rename(first.with_name("moved" + first.suffix))
+    (vault / "sibling.md").write_text("sibling")
+    _git_at(vault, "add", "-u")
+    _git_at(vault, "add", "sibling.md")
+    if change == "rename":
+        _git_at(vault, "add", str(first.with_name("moved" + first.suffix)))
+    _git_at(vault, "commit", "-qm", "modify old input and add sibling")
+    first.write_text("first edition")
+    for args in [("--dry-run",), (), ()]:
+        assert run(monkeypatch, vault, *args) == 1
+        assert checkpoint.read_bytes() == baseline
+    destination.create_memory.assert_not_called()
+    destination.create_artifact.assert_not_called()
+    destination.upload_document_bytes.assert_not_called()
+
+
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("wrong", ["dirty", "missing"])
+def test_verify_every_legacy_git_snapshot_before_resume(monkeypatch, vault, destination, partial, wrong):
+    import json
+    _git_at(vault, "init")
+    for name in ["a.md", "b.md"]:
+        (vault / name).write_text(name)
+    _git_at(vault, "add", ".")
+    _git_at(vault, "commit", "-qm", "baseline")
+    assert run(monkeypatch, vault) == 0
+    cp = vault / importer.CHECKPOINT_FILENAME
+    old = json.loads(cp.read_text())
+    old["git_baseline_version"] = 2
+    if partial:
+        old["phase"] = "memories"
+    name = "b.md"
+    target = vault / name
+    if wrong == "dirty":
+        import hashlib
+        target.write_text("unpublished draft")
+        old["source_hashes"][name] = hashlib.sha256(target.read_bytes()).hexdigest()
+    else:
+        target.unlink()
+        del old["source_hashes"][name], old["memories"][name]
+    cp.write_text(json.dumps(old))
+    baseline = cp.read_bytes()
+    destination.reset_mock()
+    for args in [("--dry-run",), (), ()]:
+        assert run(monkeypatch, vault, *args) == 1
+        assert cp.read_bytes() == baseline
+    destination.create_memory.assert_not_called()
+    _git_at(vault, "restore", name)
+    if wrong == "dirty":
+        assert run(monkeypatch, vault) == 1
+        assert cp.read_bytes() == baseline
+    else:
+        destination.create_memory.side_effect = ["new-receipt"]
+        assert run(monkeypatch, vault) == 0
+        assert run(monkeypatch, vault) == 0
+        destination.create_memory.assert_called_once()
+
+
+def test_incomplete_git_retry_stops_when_new_commit_changes_planned_inputs(monkeypatch, vault, destination):
+    _git_at(vault, "init")
+    for name in ["a.md", "b.md"]:
+        (vault / name).write_text(name)
+    _git_at(vault, "add", ".")
+    _git_at(vault, "commit", "-qm", "base")
+    destination.create_memory.side_effect = ["already-created", importer.APIError(422, "reject", "/memories")]
+    assert run(monkeypatch, vault) == 1
+    cp = vault / importer.CHECKPOINT_FILENAME
+    saved = cp.read_bytes()
+    (vault / "a.md").write_text("amended")
+    _git_at(vault, "add", "a.md")
+    _git_at(vault, "commit", "-qm", "edit")
+    (vault / "a.md").write_text("a.md")
+    destination.reset_mock()
+    assert run(monkeypatch, vault, "--dry-run") == 1
+    assert run(monkeypatch, vault) == 1
+    assert cp.read_bytes() == saved
+    destination.create_memory.assert_not_called()

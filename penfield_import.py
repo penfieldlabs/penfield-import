@@ -296,7 +296,7 @@ class Checkpoint:
         d = {
             "phase": self.phase,
             "scope": self.scope,
-            "git_baseline_version": 2 if self.git_inventory_checked else 0,
+            "git_baseline_version": 3 if self.git_inventory_checked else 0,
             "source_hashes": self.source_hashes,
             "unresolved_links": self.unresolved_links,
             "pending_write": self.pending_write,
@@ -339,7 +339,7 @@ class Checkpoint:
             raise ValueError("Unrecognized vault checkpoint phase")
         return cls(
             scope=data.get("scope", {}),
-            git_inventory_checked=data.get("git_baseline_version") == 2,
+            git_inventory_checked=data.get("git_baseline_version") == 3,
             source_hashes=data.get("source_hashes", {}),
             unresolved_links=data.get("unresolved_links", []),
             pending_write=data.get("pending_write"),
@@ -423,23 +423,34 @@ def _git_head_sha(vault_path: Path) -> Optional[str]:
     return None
 
 
-def _git_new_files_since(vault_path: Path, since_sha: str, end_sha: str = "HEAD") -> list[str]:
+def _git_new_files_since(vault_path: Path, since_sha: str, end_sha: str = "HEAD",
+                         known_paths=()) -> list[str]:
     """Return added vault input paths exactly as stored by Git."""
     result = subprocess.run(
-        ["git", "diff", "--relative", "--raw", "-z", "--no-renames", "--diff-filter=A", since_sha, end_sha, "--", "."],
+        ["git", "diff", "--relative", "--raw", "--no-abbrev", "-z", "--no-renames", since_sha, end_sha, "--", "."],
         capture_output=True, timeout=30, cwd=vault_path,
     )
     if result.returncode:
         raise ValueError("Cannot determine changes since the checkpoint's git commit")
     exts = {pattern[1:] for pattern in SUPPORTED_EXTENSIONS}
     fields = result.stdout.split(b"\0")
-    paths = (Path(os.fsdecode(raw)) for header, raw in zip(fields[::2], fields[1::2])
-             if header.split()[1] in (b"100644", b"100755"))
-    return [p.as_posix() for p in paths if p.suffix.lower() in exts or p.parts[0] in {"Documents", "Artifacts"}]
+    known = {unicodedata.normalize("NFC", key) for key in known_paths}
+    added = []
+    for header, raw in zip(fields[::2], fields[1::2]):
+        _, new_mode, old_blob, new_blob, status = header.split()
+        key = os.fsdecode(raw)
+        if status != b"A":
+            if unicodedata.normalize("NFC", key) in known and (old_blob != new_blob or new_mode not in (b"100644", b"100755")):
+                raise ValueError(f"Committed input {key} changed or was removed; reconcile its destination receipt")
+            continue
+        path = Path(key)
+        if new_mode in (b"100644", b"100755") and (path.suffix.lower() in exts or path.parts[0] in {"Documents", "Artifacts"}):
+            added.append(key)
+    return added
 
 
-def _git_unrecorded_inputs(vault_path: Path, commit: str, known: dict[str, str]) -> set[str]:
-    """Find regular files an older checkpoint omitted at its saved commit."""
+def _git_regular_files(vault_path: Path, commit: str) -> set[str]:
+    """List regular files from the pinned tree independently of the working copy."""
     tree = subprocess.run(["git", "ls-tree", "-rz", commit, "--", "."], cwd=vault_path,
                           capture_output=True, timeout=30)
     if tree.returncode:
@@ -449,9 +460,7 @@ def _git_unrecorded_inputs(vault_path: Path, commit: str, known: dict[str, str])
         if item:
             meta, name = item.split(b"\t", 1)
             if meta.split()[0] in (b"100644", b"100755"):
-                path = os.fsdecode(name)
-                if path not in known:
-                    paths.add(path)
+                paths.add(os.fsdecode(name))
     return paths
 
 
@@ -471,6 +480,45 @@ def _verify_git_inventory(vault_path, commit, paths, inventory, skip_dirs, requi
     selected = {key: digest for key, digest in inventory.items()
                 if key in required or unicodedata.normalize("NFC", key) in normalized}
     _verify_committed_additions(vault_path, selected, eligible, commit)
+
+
+def _resume_vault_snapshot(vault, state, head, hashes, inventory, skip_dirs):
+    """Check an existing snapshot without updating receipts or advancing the commit."""
+    pinned = state.commit_sha
+    changed = hashes != state.source_hashes
+    if any(hashes.get(key) != digest for key, digest in state.source_hashes.items()):
+        raise ValueError("Previously recorded vault input changed; reconcile source and destination before retry")
+    if not pinned:
+        if changed:
+            raise ValueError("Vault inputs changed since the checkpoint; reconcile the destination")
+        return None
+    if not head:
+        raise ValueError("Cannot verify the saved Git commit; restore access to the original repository")
+
+    new = hashes.keys() - state.source_hashes.keys()
+    legacy_paths = set()
+    if not state.git_inventory_checked:
+        legacy_paths = _git_regular_files(vault, pinned)
+        # Include already receipted paths: the old first import could have stored dirty bytes.
+        _verify_git_inventory(vault, pinned, legacy_paths, inventory, skip_dirs)
+
+    if state.phase != "done" or pinned == head:
+        if new:
+            # An older baseline could have omitted a committed file. Only recover
+            # missing pinned inputs; a partial run cannot admit unrelated new work.
+            if not legacy_paths:
+                raise ValueError("Vault inputs changed since the checkpoint; restore the saved snapshot")
+            _verify_git_inventory(vault, pinned, legacy_paths, inventory, skip_dirs, new)
+        if head != pinned:
+            added = _git_new_files_since(vault, pinned, head, state.source_hashes)
+            if any(_vault_path_eligible(Path(path), skip_dirs) for path in added):
+                raise ValueError("Git inputs advanced during an incomplete restore; restore the pinned commit before retry")
+        return pinned
+
+    added = _git_new_files_since(vault, pinned, head, state.source_hashes)
+    paths = set(added) | legacy_paths
+    _verify_git_inventory(vault, head, paths, inventory, skip_dirs, new)
+    return head
 
 
 def _git_text_checkout_is_crlf(vault_path: Path, path: str) -> bool:
@@ -2216,6 +2264,7 @@ class ZipCheckpoint:
     artifact_mime_mismatches: dict[str, str] = field(default_factory=dict)
     artifact_type_receipts: dict[str, str] = field(default_factory=dict)
     typed_metadata_v1: dict[str, str] = field(default_factory=dict)
+    memory_field_receipts: dict[str, str] = field(default_factory=dict)
     metadata_issues: dict[str, str] = field(default_factory=dict)
     relationship_id_map: dict[str, str] = field(default_factory=dict)
     relationship_receipt_checks: dict[str, str] = field(default_factory=dict)
@@ -2297,9 +2346,9 @@ class ZipCheckpoint:
                                  for section, mapping in (("memories", self.memory_id_map), ("contexts", self.contexts),
                                                           ("documents", self.documents))
                                  for key, dest in mapping.items() if not dest.startswith(SKIP_SENTINEL_PREFIX)}
-        if (any(metadata_destinations.get(key) != dest for key, dest in self.typed_metadata_v1.items())
-                or not self.metadata_issues.keys() <= metadata_destinations.keys()
-                or self.metadata_issues.keys() & self.typed_metadata_v1.keys()):
+        if (any(self.memory_id_map.get(key) != dest for key, dest in self.memory_field_receipts.items())
+                or any(metadata_destinations.get(key) != dest for key, dest in self.typed_metadata_v1.items())
+                or not self.metadata_issues.keys() <= metadata_destinations.keys()):
             raise ValueError("Inconsistent metadata verification receipts")
         if not (self.artifact_type_receipts.keys() <= self.artifacts.keys()
                 and self.document_processing.keys() <= self.documents.keys()
@@ -2411,8 +2460,10 @@ def _validate_zip_record(section: str, rec: dict[str, Any]) -> str:
         tags = rec.get("tags") or []
         if len(tags) > 10 or any(not 1 <= len(normalize_tag(tag)) <= 50 for tag in tags):
             raise ValueError("invalid tags (maximum 10, each 1–50 normalized characters)")
-    if section == "relationships" and rec["from_id"] == rec["to_id"]:
-        raise ValueError("self-relationships cannot be restored")
+    if section == "relationships":
+        left, right = rec["from_id"], rec["to_id"]
+        if left == right or (_UUID_TEXT.fullmatch(left) and left.lower() == right.lower()):
+            raise ValueError("self-relationships cannot be restored")
     if section == "relationships" and "traversal_properties" in rec and not isinstance(rec["traversal_properties"], dict):
         raise ValueError("invalid traversal_properties; expected an object")
     if rec.get("direction_type") == "INVERSE_PAIRED" and not rec.get("inverse_type"):
@@ -2521,6 +2572,36 @@ def validate_zip_manifest(zf: zipfile.ZipFile, source_keys: Optional[dict[str, s
     return manifest
 
 
+def _zip_memory_fields(row):
+    """Source fields as represented on the destination after the supported transformations."""
+    fields = {key: row[key] for key in ("content", "memory_type", "source_type", "importance", "confidence")
+              if row.get(key) is not None}
+    fields["tags"] = row.get("tags") or []
+    fields["metadata"] = row.get("metadata") or {}
+    if fields.get("memory_type") == "personality_trait":
+        fields["memory_type"] = "fact"
+        prefixed = "[Imported personality_trait]\n\n" + fields["content"]
+        if len(prefixed) <= MEMORY_CONTENT_LIMIT:
+            fields["content"] = prefixed
+    return fields
+
+
+def _memory_field_differences(expected, stored):
+    differences = []
+    for key, wanted in expected.items():
+        value = stored.get(key)
+        if key == "tags":
+            wanted = sorted({normalize_tag(tag) for tag in wanted})
+            if isinstance(value, list) and all(isinstance(tag, str) for tag in value):
+                value = sorted(value)
+            elif value is None:
+                value = []
+        matches = (_source_object_matches(wanted, value) if key == "metadata" else _json_values_equal(value, wanted))
+        if not matches:
+            differences.append(key)
+    return differences
+
+
 def run_zip_memories_phase(
     zf: zipfile.ZipFile,
     client: PenfieldClient,
@@ -2545,24 +2626,12 @@ def run_zip_memories_phase(
 
         if memory_type == "personality_trait":
             logger.info("[row %d] Downgrading personality_trait to fact: %s", i, source_id)
-            prefixed = f"[Imported personality_trait]\n\n{rec['content']}"
-            if len(prefixed) <= MEMORY_CONTENT_LIMIT:
-                rec["content"] = prefixed
-            memory_type = "fact"
-
+        fields = _zip_memory_fields(rec)
         logger.info("[row %d] Creating memory: %s", i, source_id)
-
         checkpoint.write_keys = [source_id]
         try:
-            new_id = client.create_memory(
-                content=rec["content"],
-                tags=rec.get("tags"),
-                memory_type=memory_type,
-                importance=rec.get("importance"),
-                confidence=rec.get("confidence"),
-                source_type=rec.get("source_type"),
-                metadata=rec.get("metadata"),
-            )
+            new_id = client.create_memory(**fields)
+            checkpoint.memory_field_receipts[source_id] = new_id
             if rec.get("metadata"):
                 checkpoint.typed_metadata_v1["memories/" + source_id] = new_id
             checkpoint.memory_id_map[source_id] = new_id
@@ -3016,17 +3085,35 @@ def _recheck_saved_fields(archive, client, checkpoint):
             key = section + "/" + row["id"]
             dest = ledger.get(row["id"])
             expected = row.get(field)
-            if (not expected or not dest or dest.startswith(SKIP_SENTINEL_PREFIX)
-                    or checkpoint.typed_metadata_v1.get(key) == dest):
+            if not dest or dest.startswith(SKIP_SENTINEL_PREFIX):
+                continue
+            needs_metadata = expected and checkpoint.typed_metadata_v1.get(key) != dest
+            needs_memory = section == "memories" and checkpoint.memory_field_receipts.get(row["id"]) != dest
+            if not (needs_metadata or needs_memory):
                 continue
             checked = True
             try:
                 stored = client._readback(route + urllib.parse.quote(dest, safe=""))
-                if stored.get("id") == dest and _source_object_matches(expected, stored.get("metadata")):
-                    checkpoint.typed_metadata_v1[key] = dest
+                if section == "memories":
+                    fields = dict(_zip_memory_fields(row), id=dest)
+                    differences = _memory_field_differences(fields, stored)
+                else:
+                    differences = []
+                    if stored.get("id") != dest:
+                        differences.append("id")
+                    if not _source_object_matches(expected, stored.get("metadata")):
+                        differences.append("metadata")
+                if not differences:
+                    if expected:
+                        checkpoint.typed_metadata_v1[key] = dest
+                    if section == "memories":
+                        checkpoint.memory_field_receipts[row["id"]] = dest
                     checkpoint.metadata_issues.pop(key, None)
                     continue
-                reason = "destination ID or metadata mismatch"
+                checkpoint.typed_metadata_v1.pop(key, None)
+                if section == "memories":
+                    checkpoint.memory_field_receipts.pop(row["id"], None)
+                reason = "destination differs in " + ", ".join(differences)
             except APIError:
                 reason = "destination read unavailable"
             checkpoint.metadata_issues[key] = reason
@@ -3948,9 +4035,14 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
     fresh = args.reset or not checkpoint_path.exists()
     baseline_sha = _git_head_sha(vault_path) if fresh else None
     if baseline_sha:
-        _verify_git_inventory(vault_path, baseline_sha, _git_unrecorded_inputs(vault_path, baseline_sha, {}),
+        _verify_git_inventory(vault_path, baseline_sha, _git_regular_files(vault_path, baseline_sha),
                               inventory, set(args.skip_dirs))
     if args.dry_run:
+        if not fresh:
+            saved = Checkpoint.load(checkpoint_path)
+            if saved.pending_write is not None:
+                raise ValueError("Checkpoint contains an unconfirmed write; reconcile it before resuming")
+            _resume_vault_snapshot(vault_path, saved, _git_head_sha(vault_path), hashes, inventory, set(args.skip_dirs))
         dry_run_report(notes, args, artifact_count=len(artifacts), document_count=len(documents))
         return int(bool(preview.unresolved_links))
     if preview.unresolved_links:
@@ -4039,23 +4131,10 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
                                  "or predates scoped checkpoints. Choose a new checkpoint directory "
                                  "after reconciling existing destination records.")
             changed_inventory = hashes != checkpoint.source_hashes
-            advanced = current_sha and current_sha != checkpoint.commit_sha
-            legacy_git = checkpoint.phase == "done" and checkpoint.commit_sha and not checkpoint.git_inventory_checked
-            if changed_inventory or legacy_git or (advanced and checkpoint.phase == "done" and checkpoint.commit_sha):
-                if checkpoint.phase != "done" or not checkpoint.commit_sha or not current_sha:
-                    raise ValueError("Vault inputs changed since the checkpoint. Restore the saved inputs "
-                                     "or use a separate checkpoint after reconciling the destination.")
-                if any(hashes.get(key) != digest for key, digest in checkpoint.source_hashes.items()):
-                    raise ValueError("Completed vault changed beyond committed additions. "
-                                     "Reconcile the source and destination before another import.")
-                added = set(_git_new_files_since(vault_path, checkpoint.commit_sha, current_sha))
-                if legacy_git:
-                    # An old successful increment could omit a committed file and advance its SHA.
-                    added.update(_git_unrecorded_inputs(vault_path, checkpoint.commit_sha, checkpoint.source_hashes))
-                _verify_git_inventory(vault_path, current_sha, added, inventory, set(args.skip_dirs),
-                                      hashes.keys() - checkpoint.source_hashes.keys())
-                if changed_inventory:
-                    checkpoint.commit_sha = current_sha
+            planned_sha = _resume_vault_snapshot(vault_path, checkpoint, current_sha, hashes, inventory, set(args.skip_dirs))
+            save_baseline = bool(planned_sha and (planned_sha != checkpoint.commit_sha or not checkpoint.git_inventory_checked))
+            checkpoint.commit_sha = planned_sha
+            checkpoint.git_inventory_checked = bool(planned_sha)
             # R2 could mark a preflighted artifact skipped after its local bytes changed.
             # Only skip markers can be safely retried without reconciling a possible write.
             if any(checkpoint.vault_artifacts.get(key, "").startswith(SKIP_SENTINEL_PREFIX)
@@ -4065,8 +4144,7 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
                 if not receipts_complete(checkpoint):
                     raise ValueError("Completed checkpoint has missing or unexpected receipts; reconcile before resuming")
                 if all(checkpoint.document_index_state(key) == "ready" for key in checkpoint.documents):
-                    if legacy_git:
-                        checkpoint.git_inventory_checked = True
+                    if save_baseline:
                         checkpoint.save(checkpoint_path)
                     logger.info("Vault already imported for this destination and snapshot.")
                     return 0
@@ -4075,8 +4153,6 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
             if not fresh or current_sha != baseline_sha:
                 raise ValueError("Git baseline or checkpoint changed during preflight; retry the import")
             checkpoint.commit_sha = current_sha
-            checkpoint.git_inventory_checked = True
-        if checkpoint.phase == "done":
             checkpoint.git_inventory_checked = True
         checkpoint.scope = scope
         checkpoint.source_hashes = hashes

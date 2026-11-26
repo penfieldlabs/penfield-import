@@ -58,20 +58,13 @@ def _different_fields(expected, actual):
 
 
 def _memory(record, stored, dest, result):
-    expected = {k: record[k] for k in ("memory_type", "source_type", "importance", "confidence")
-                if record.get(k) is not None}
-    expected.update(id=dest, content=record["content"], tags=record.get("tags") or [],
-                    metadata=record.get("metadata") or {})
-    if expected.get("memory_type") == "personality_trait":
-        expected["memory_type"] = "fact"
-        prefixed = "[Imported personality_trait]\n\n" + record["content"]
-        if len(prefixed) <= importer.MEMORY_CONTENT_LIMIT:
-            expected["content"] = prefixed
+    expected = dict(importer._zip_memory_fields(record), id=dest)
+    if record.get("memory_type") == "personality_trait":
         result["transformation"] = "personality_trait_to_fact"
     result["expected_content_sha256"] = _sha(expected["content"].encode())
     content = stored.get("content")
     result["actual_content_sha256"] = _sha(content.encode()) if isinstance(content, str) else None
-    result["mismatched_fields"].extend(_different_fields(expected, stored))
+    result["mismatched_fields"].extend(importer._memory_field_differences(expected, stored))
 
 
 def _context(record, stored, dest, mapped, checkpoint, source_ids, aliases, result):

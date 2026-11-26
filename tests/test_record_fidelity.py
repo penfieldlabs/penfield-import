@@ -320,3 +320,25 @@ def test_absent_artifact_mime_type_requires_readback_without_reupload(tmp_path, 
     stored["content_type"] = "text/markdown"
     assert imp.run_zip_import(archive, api) == 0
     assert verify(archive)[0] == 0 and len(writes) == 1
+
+
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_scalar_types_in_receipt_from_older_candidate(tmp_path, monkeypatch, with_metadata):
+    service = Service(monkeypatch)
+    from test_zip_import_recovery import export
+    metadata = {"verified": True} if with_metadata else {}
+    archive = export(tmp_path, memories=[{"id": "a", "content": "A", "importance": 1,
+                                          "confidence": 1, "metadata": metadata}])
+    assert imp.run_zip_import(archive, service.api) == 0
+    cp = tmp_path / imp.ZIP_CHECKPOINT_FILENAME
+    old = json.loads(cp.read_text())
+    del old["memory_field_receipts"]
+    cp.write_text(json.dumps(old))
+    service.objects["/memories/A"].update(importance=True, confidence=True)
+    for attempt in range(2):
+        assert imp.run_zip_import(archive, service.api) == 2
+        code, rows = verify(archive, f"wrong-{attempt}.jsonl")
+        assert code == 2 and set(rows[0]["mismatched_fields"]) == {"importance", "confidence"}
+    service.objects["/memories/A"].update(importance=1, confidence=1)
+    assert imp.run_zip_import(archive, service.api) == 0
+    assert verify(archive)[0] == 0 and len(service.posted) == 1

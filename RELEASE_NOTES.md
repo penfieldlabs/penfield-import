@@ -10,6 +10,8 @@ R2 (`d4d14e1`) could advance past a missing committed file, record a skipped vau
 
 R3 (`fc0924c`) could omit a committed file on a first Git import. Older ZIP receipts could also hide a Boolean/number change in stored metadata. This revision checks the first Git snapshot before writes and rechecks metadata on upgrade for memories, contexts and documents. Two distinct vault notes must receive distinct IDs. An unavailable artifact media type is a partial result even when its bytes match.
 
+R4 (`840bda1`) could advance its saved Git commit past an edited input while the working copy still held the previously imported text. This revision checks the commit diff before writing a sibling or advancing the checkpoint, and applies the same eligibility check in preview. Completed and interrupted legacy Git imports must pass a full snapshot check on their first resume. Older ZIP memory receipts now qualify all comparable source fields, including numeric importance and confidence. A self-relationship with case-variant UUID endpoints fails ZIP preflight before any write.
+
 ## Restoring with the candidate
 
 1. Create a virtual environment and install the package as described in the README.
