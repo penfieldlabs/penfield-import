@@ -255,3 +255,204 @@ def test_canonically_equivalent_stems_are_ambiguous_until_qualified(monkeypatch,
     state = importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME)
     literal = next(key for key in state.memories if key.startswith("a/"))
     assert state.relationships_done == {f"source.md|{literal}|references"}
+
+
+def _git_at(root, *args):
+    return subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", *args],
+                          cwd=root, check=True, capture_output=True).stdout.decode().strip()
+
+
+@pytest.mark.parametrize("dirty", ["new.md", "Artifacts/new.txt", "Documents/new.txt"])
+def test_incremental_requires_committed_bytes_before_writes(monkeypatch, vault, destination, dirty):
+    destination.upload_document_bytes.return_value = {"id": "document-1", "processing_status": "complete"}
+    _git_at(vault, "init")
+    (vault / "base.md").write_text("base")
+    _git_at(vault, "add", "base.md")
+    _git_at(vault, "commit", "-qm", "base")
+    assert run(monkeypatch, vault) == 0
+    cp = vault / importer.CHECKPOINT_FILENAME
+    baseline = cp.read_bytes()
+    paths = ["new.md", "Artifacts/new.txt", "Documents/new.txt"]
+    for name in paths:
+        p = vault / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"committed")
+    _git_at(vault, "add", "--", *paths)
+    _git_at(vault, "commit", "-qm", "additions")
+    (vault / dirty).write_bytes(b"private working copy")
+    _git_at(vault, "update-index", "--assume-unchanged", "--", dirty)
+    assert run(monkeypatch, vault) == 1
+    assert cp.read_bytes() == baseline
+    assert destination.create_memory.call_count == 1
+    destination.create_artifact.assert_not_called()
+    destination.upload_document_bytes.assert_not_called()
+    (vault / dirty).write_bytes(b"committed")
+    assert run(monkeypatch, vault) == 0
+    assert run(monkeypatch, vault) == 0
+    assert destination.create_memory.call_count == 2
+    assert destination.create_memory.call_args.kwargs["content"] == "committed"
+    destination.create_artifact.assert_called_once_with("/new.txt", "committed")
+    assert destination.upload_document_bytes.call_count == 1
+    assert destination.upload_document_bytes.call_args.args == ("new.txt", b"committed")
+
+
+def test_incremental_checkout_eol_and_unicode_in_subdirectory(monkeypatch, vault, destination):
+    _git_at(vault.parent, "init")
+    (vault.parent / ".gitattributes").write_text("*.md text eol=crlf\n")
+    (vault / "base.md").write_bytes(b"base\r\n")
+    _git_at(vault.parent, "add", ".gitattributes", "vault/base.md")
+    _git_at(vault.parent, "commit", "-qm", "base")
+    assert run(monkeypatch, vault) == 0
+    p = vault / "intro - cafe\u0301.md"
+    p.write_bytes(b"clean\r\n")
+    _git_at(vault.parent, "add", "--", str(p.relative_to(vault.parent)))
+    _git_at(vault.parent, "commit", "-qm", "new note")
+    assert run(monkeypatch, vault) == 0
+    assert run(monkeypatch, vault) == 0
+    assert destination.create_memory.call_count == 2
+
+
+def test_incremental_retry_keeps_verified_commit_when_head_moves(monkeypatch, vault, destination):
+    _git_at(vault, "init")
+    (vault / "base.md").write_text("base")
+    _git_at(vault, "add", "base.md")
+    _git_at(vault, "commit", "-qm", "base")
+    assert run(monkeypatch, vault) == 0
+    (vault / "new.md").write_text("new")
+    _git_at(vault, "add", "new.md")
+    _git_at(vault, "commit", "-qm", "new")
+    pinned = _git_at(vault, "rev-parse", "HEAD")
+
+    def advance_head_and_reject(**_):
+        _git_at(vault, "commit", "--allow-empty", "-qm", "concurrent update")
+        raise importer.APIError(422, "rejected", "/memories")
+
+    destination.create_memory.side_effect = advance_head_and_reject
+    assert run(monkeypatch, vault) == 1
+    assert importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME).commit_sha == pinned
+    destination.create_memory.side_effect = None
+    destination.create_memory.return_value = "recovered"
+    assert run(monkeypatch, vault) == 0
+    assert importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME).commit_sha == pinned
+
+
+def test_local_headings_preserve_text_and_only_post_cross_note_edge(monkeypatch, vault, destination, capsys):
+    source = "## Heading\n[[#Heading]] [[#^block|there]] [[index#Heading]] [[other#Heading]]"
+    (vault / "index.md").write_text(source)
+    (vault / "other.md").write_text("## Heading")
+    opts = ("--relationships", "inline")
+    assert run(monkeypatch, vault, *opts, "--dry-run") == 0
+    assert "Relationship batches:    1 (1 total)" in capsys.readouterr().out
+    assert run(monkeypatch, vault, *opts) == 0
+    assert run(monkeypatch, vault, *opts) == 0
+    assert destination.create_memory.call_count == 2
+    assert destination.create_memory.call_args_list[0].kwargs["content"] == source
+    destination.create_relationships_bulk.assert_called_once_with(
+        [{"from_id": "memory-1", "to_id": "memory-2", "relationship_type": "references"}])
+    assert importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME).relationships_done == {"index.md|other.md|references"}
+
+
+def test_typed_local_heading_and_rejected_legacy_self_edge_can_resume(monkeypatch, vault, destination):
+    (vault / "nested").mkdir()
+    (vault / "nested" / "index.md").write_text(
+        '---\nsupports: ["[[#here]]", "[[index#here]]", "[[nested/index.md#^block]]"]\n---\n## here')
+    assert run(monkeypatch, vault) == 0
+    path = vault / importer.CHECKPOINT_FILENAME
+    state = importer.Checkpoint.load(path)
+    state.phase = "memories"
+    state.failed_relationships = ["nested/index.md|nested/index.md|supports"]
+    state.save(path)
+    assert run(monkeypatch, vault) == 0
+    assert importer.Checkpoint.load(path).failed_relationships == []
+    destination.create_memory.assert_called_once()
+    destination.create_relationships_bulk.assert_not_called()
+
+
+def test_explicit_typed_bare_self_reference_fails_before_writes(monkeypatch, vault, destination, caplog):
+    (vault / "index.md").write_text('---\nsupports: ["[[index]]"]\n---\nBody')
+    assert run(monkeypatch, vault) == 1
+    assert "self-relationships are unsupported" in caplog.text
+    destination.create_memory.assert_not_called()
+    destination.create_relationships_bulk.assert_not_called()
+
+
+def test_incremental_edits_after_preflight_never_send_dirty_bytes(monkeypatch, vault, destination):
+    _git_at(vault, "init")
+    (vault / "base.md").write_text("base")
+    _git_at(vault, "add", "base.md")
+    _git_at(vault, "commit", "-qm", "base")
+    assert run(monkeypatch, vault) == 0
+    paths = [vault / "new.md", vault / "Artifacts" / "new.txt", vault / "Documents" / "new.txt"]
+    for p in paths:
+        p.parent.mkdir(exist_ok=True)
+        p.write_text("committed")
+    _git_at(vault, "add", "--", *(str(p.relative_to(vault)) for p in paths))
+    _git_at(vault, "commit", "-qm", "add")
+    def edit_during_auth():
+        for p in paths:
+            p.write_text("private working copy")
+        return "verified-destination"
+    destination.destination_identity.side_effect = edit_during_auth
+    assert run(monkeypatch, vault) == 1
+    # Notes are immutable preflight content; attachments are rechecked when read.
+    assert destination.create_memory.call_args.kwargs["content"] == "committed"
+    destination.create_artifact.assert_not_called()
+    destination.upload_document_bytes.assert_not_called()
+
+
+def test_incremental_never_uses_a_smudge_filter_to_authorize_uncommitted_content(monkeypatch, vault, destination):
+    _git_at(vault, "init")
+    _git_at(vault, "config", "filter.reviewer.clean", "cat")
+    _git_at(vault, "config", "filter.reviewer.smudge", "touch filter-ran && cat private-bytes")
+    (vault / ".gitattributes").write_text("new.md text eol=crlf filter=reviewer\n")
+    (vault / "base.md").write_text("base")
+    _git_at(vault, "add", "base.md", ".gitattributes")
+    _git_at(vault, "commit", "-qm", "base")
+    assert run(monkeypatch, vault) == 0
+    (vault / "new.md").write_bytes(b"committed input\n")
+    _git_at(vault, "add", "new.md")
+    _git_at(vault, "commit", "-qm", "new")
+    (vault / "private-bytes").write_text("private content")
+    (vault / "new.md").write_text("private content")
+    assert not (vault / "filter-ran").exists()
+    cp = vault / importer.CHECKPOINT_FILENAME
+    saved = cp.read_bytes()
+    assert run(monkeypatch, vault) == 1
+    assert not (vault / "filter-ran").exists()
+    assert cp.read_bytes() == saved
+    destination.create_memory.assert_called_once()
+    (vault / "new.md").write_bytes(b"committed input\r\n")
+    assert run(monkeypatch, vault) == 0
+    assert not (vault / "filter-ran").exists()
+
+
+def test_single_details_heading_preview_restore_and_repeat(monkeypatch, vault, destination, capsys):
+    text = "## Details\n[[#Details]]"
+    (vault / "single.md").write_text(text)
+    opts = ("--relationships", "inline")
+    assert run(monkeypatch, vault, *opts, "--dry-run") == 0
+    preview = capsys.readouterr().out
+    assert "Relationships:     0" in preview and "Relationship batches:    0 (0 total)" in preview
+    destination.create_memory.assert_not_called()
+    assert run(monkeypatch, vault, *opts) == 0
+    assert run(monkeypatch, vault, *opts) == 0
+    destination.create_memory.assert_called_once_with(content=text, tags=[], memory_type=None)
+    destination.create_relationships_bulk.assert_not_called()
+
+
+def test_legacy_unconfirmed_heading_write_stops_before_receipt_migration(monkeypatch, vault, destination, caplog):
+    (vault / "index.md").write_text("## Details\n[[#Details]]")
+    opts = ("--relationships", "inline")
+    assert run(monkeypatch, vault, *opts) == 0
+    path = vault / importer.CHECKPOINT_FILENAME
+    state = importer.Checkpoint.load(path)
+    key = "index.md|index.md|references"
+    state.phase = "relationships"
+    state.failed_relationships = [key]
+    state.pending_write = {"kind": "relationships", "keys": [key]}
+    state.save(path)
+    before = path.read_bytes()
+    assert run(monkeypatch, vault, *opts) == 1
+    assert "unconfirmed write" in caplog.text and path.read_bytes() == before
+    destination.create_memory.assert_called_once()
+    destination.create_relationships_bulk.assert_not_called()

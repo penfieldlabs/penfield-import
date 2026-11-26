@@ -1361,11 +1361,11 @@ class TestDocumentsPhase:
         cp_path = tmp_path / ".penfield_import_checkpoint.json"
 
         mock_client = mock.MagicMock()
-        mock_client.upload_document_bytes.return_value = {"id": "doc-uuid"}
+        mock_client.upload_document_bytes.side_effect = lambda name, data, **kwargs: {"id": "doc-" + name}
 
         vtp.run_documents_phase(tmp_path, mock_client, cp, cp_path)
 
-        # 10 supported types uploaded — not .png or .exe
+        # Each of the 11 supported files receives its own ID.
         assert mock_client.upload_document_bytes.call_count == 11
         assert len(cp.documents) == 11
         mock_client.upload_document_bytes.assert_any_call(

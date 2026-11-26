@@ -2,6 +2,10 @@
 
 This branch is for external review. Version 2.0.0 could exit successfully after a rejected write and could skip data when reusing a checkpoint. Keep the original archives and all existing checkpoints when investigating an earlier restore.
 
+The first 2.0.1 review build, `675da708`, could accept stale context references and could equate JSON booleans with numbers when comparing relationship evidence. For a ZIP restored with that build, retain the original input and checkpoint and run the current read-only verifier. It reports affected rows, including repeated document IDs. It also checks explicit UUID references in context descriptions. An absent referenced source can produce an incomplete result even when every context member listed in the archive has been restored. Repeating an import against a populated destination with a fresh checkpoint can create duplicates.
+
+Incremental Git imports check new notes, artifacts and documents against the selected commit before sending them. Same-note heading and block links remain in the original text. Preview lists contexts blocked by a cycle and the source rows involved. Nullable optional edge fields use the API defaults.
+
 ## Restoring with the candidate
 
 1. Create a virtual environment and install the package as described in the README.

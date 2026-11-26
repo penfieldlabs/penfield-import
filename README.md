@@ -26,7 +26,7 @@ penfield-import /path/to/export.zip --checkpoint-dir /tmp/import-state
 
 ### How ZIP import works
 
-Preview reads the archive locally. It checks the manifest and JSONL rows, record identities and referenced payloads. The manifest and each JSONL row are limited to 16 MiB. Review the counts, protected types and missing context members before choosing a destination. Use a different checkpoint directory for each archive and destination.
+Preview reads the archive locally. It checks the manifest and JSONL rows, record identities and referenced payloads. The manifest and each JSONL row are limited to 16 MiB. Review the counts, protected types, and unresolved references in context memberships and descriptions before choosing a destination. Use a different checkpoint directory for each archive and destination.
 
 1. **Memories.** The importer creates ordinary memories with their supported metadata. It excludes protected `identity_core` records and converts `personality_trait` to `fact`. The attribution prefix is added only when it fits.
 2. **Contexts.** Saved contexts become checkpoint memories. The checkpoint name and restored member count are verified in the stored JSON content. The memory metadata preserves fields from the export’s `checkpoint_metadata` object. Members can point to ordinary memories or other contexts, including later rows. The importer resolves these dependencies and preserves membership order. An absent member, a dependency cycle or a destination conflict remains visible in the result.
@@ -55,9 +55,15 @@ The JSONL report has one row per source record and is created with owner-only pe
 
 A ZIP run exits `0` when the supported restore is accounted for, including the documented protected-memory exclusion. Exit `2` indicates an incomplete ZIP restore. Exit `1` indicates that the importer stopped, for example on invalid input, a mismatched checkpoint or an uncertain write. Read the per-section results and keep the checkpoint for reconciliation.
 
-Ownership, server timestamps, evolution state, artifact modification dates, document tags and other server-managed fields can differ from the archive. Artifact media types are determined by the service. UUIDs in ordinary free text retain their original spelling. Explicit `memory_id:` references in context descriptions are remapped when a destination mapping is available.
+Ownership, server timestamps, evolution state, artifact modification dates, document tags and other server-managed fields can differ from the archive. Artifact media types are determined by the service. UUIDs in ordinary free text retain their original spelling. A context description token of the form `memory_id: <UUID>` is a dependency, just like a listed context member. Forward tokens use the new destination ID even when the target context appears later in the ZIP. Preview identifies self references, cycles and dependent rows by source line and ID. Restore defers these rows and continues with independent contexts. An absent or excluded description ID stays verbatim and is recorded in `context_unresolved_descriptions`, separately from missing memberships. The restore exits 2. Other contexts can still refer to a partially restored context with a confirmed destination ID.
+
+When an older checkpoint lacks description verification, a resume reads the existing destination context and compares its description with the current source-to-destination map. A stale description remains incomplete until reconciled; the importer retains the existing receipt and avoids creating a duplicate.
 
 A tagged document can have a verified upload and an incomplete restore. The ZIP checkpoint lists its original tags under `document_tag_omissions` and the command exits 2. The documents API accepts custom metadata and has no native document tag field.
+
+Each source document needs its own destination ID, even when two files have identical names and bytes. ZIP relationship rows can share a destination ID only when their submitted payloads match and the service confirmed an identical existing edge for every row beyond the first. Two fresh creates returning the same ID stop the import. The verifier marks every row involved in an invalid shared receipt.
+
+ZIP relationships with a null direction, strength, or confidence use the service default for that field. Metadata and evidence checks preserve JSON types throughout nested objects and arrays. For example, a boolean changed to a number is a mismatch. Numeric values such as `1` and `1.0` compare equally.
 
 ### When a create has an uncertain outcome
 
@@ -214,6 +220,8 @@ For a much richer import, add typed relationships before importing. Two approach
 
 Use `frontmatter` (default) when importing from penfield-export or vaults with typed frontmatter. Use `inline` for human-built Obsidian vaults with no typed frontmatter. Use `both` when your vault has a mix of typed frontmatter and inline wikilinks.
 
+Same-note heading and block links such as `[[#Heading]]` and `[[Current Note#^block]]` stay in the Markdown. A link to a heading in another note creates a relationship to that note. An explicit relationship to the current note without a fragment fails validation before any writes.
+
 Frontmatter keys matching a standard relationship type with wikilink values are imported:
 
 ```yaml
@@ -348,7 +356,7 @@ python penfield_import.py /path/to/vault
 python penfield_import.py /path/to/vault
 ```
 
-- Incremental imports accept committed additions, including files in `Artifacts/` and `Documents/`. If previously imported inputs change, reconcile the destination before starting a different restore.
+- Incremental imports compare each new note, artifact and document with its Git blob at the recorded commit. Text files may use CRLF working-copy line endings for an LF blob. Other differences stop the run before any writes. Commit the edit or restore the committed content before retrying. Changes to previously imported inputs require reconciliation with the destination.
 - The checkpoint stores the full `{rel_path: memory_id}` map from all prior runs, so relationships from new notes to existing notes resolve correctly.
 - For non-Git vaults, repeating a completed import checks the source snapshot and destination identity. A changed snapshot requires a separate restore decision.
 

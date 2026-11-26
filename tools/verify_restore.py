@@ -49,11 +49,9 @@ def _different_fields(expected, actual):
             wanted = sorted({importer.normalize_tag(tag) for tag in wanted})
             value = sorted(value) if isinstance(value, list) else ([] if value is None else value)
         elif key in {"metadata", "evidence"} and isinstance(wanted, dict):
-            # Ignore fields added by the service; compare every key supplied by the source.
-            if isinstance(value, dict):
-                value = {k: value[k] for k in wanted if k in value}
-            elif value is None and not wanted:
-                value = {}
+            if not importer._source_object_matches(wanted, value):
+                different.append(key)
+            continue
         if not importer._json_values_equal(value, wanted):
             different.append(key)
     return different
@@ -76,11 +74,13 @@ def _memory(record, stored, dest, result):
     result["mismatched_fields"].extend(_different_fields(expected, stored))
 
 
-def _context(record, stored, dest, mapped, checkpoint, source_ids, result):
+def _context(record, stored, dest, mapped, checkpoint, source_ids, aliases, result):
     original = record.get("memory_ids") or []
     members = [mapped[mid] for mid in original if mid in mapped]
     missing = [mid for mid in original if mid not in mapped]
-    description = MEMBER_TOKEN.sub(lambda m: m[1] + mapped.get(m[2], m[2]), record.get("description") or "")
+    description = MEMBER_TOKEN.sub(
+        lambda m: m[1] + mapped.get(aliases.get(m[2].lower(), m[2]), m[2]), record.get("description") or "",
+    )
     tags = ["context", "checkpoint"]
     name_tag = importer.normalize_tag(record["name"])
     if name_tag not in tags and 1 <= len(name_tag) <= 50:
@@ -99,11 +99,19 @@ def _context(record, stored, dest, mapped, checkpoint, source_ids, result):
     else:
         bad.append("content.structure")
     result.update(source_member_count=len(original), resolved_member_count=len(members), missing_members=missing)
+    tokens = [aliases.get(m[2].lower(), m[2]) for m in MEMBER_TOKEN.finditer(record.get("description") or "")]
+    missing_tokens = [mid for mid in tokens if mid not in mapped]
+    if missing_tokens:
+        result["missing_description_references"] = missing_tokens
+    if missing_tokens != checkpoint.context_unresolved_descriptions.get(record["id"], []):
+        bad.append("checkpoint.unresolved_description_references")
+    if any(mid in source_ids and mid not in checkpoint.skipped_memories for mid in missing_tokens):
+        bad.append("unresolved_importable_description_reference")
     if missing != checkpoint.context_unresolved.get(record["id"], []):
         bad.append("checkpoint.unresolved_members")
     if any(mid in source_ids and mid not in checkpoint.skipped_memories for mid in missing):
         bad.append("unresolved_importable_member")
-    if missing:
+    if missing or missing_tokens:
         result["outcome"] = "partial_source"
 
 
@@ -177,8 +185,11 @@ def _verify_rows(archive, checkpoint, keys, client, stream):
                "relationships": checkpoint.relationship_id_map, "artifacts": checkpoint.artifacts,
                "documents": checkpoint.documents}
     mapped = {k: value for section in ("memories", "contexts") for k, value in ledgers[section].items() if _real(value)}
-    destinations = Counter(mapped.values())
+    conflicting = importer._zip_conflicting_destinations(archive, checkpoint)
     source_ids = keys["memories"] | keys["contexts"]
+    aliases = importer._context_uuid_aliases(source_ids)
+    context_rows = {record["id"]: (number, record) for number, record in importer._zip_records(archive, "contexts")}
+    _, cycle_blocked = importer._context_schedule(context_rows, mapped, aliases)
     counts = {section: Counter() for section in importer.ZIP_SECTIONS}
     for section, ledger in ledgers.items():
         for number, record in importer._zip_records(archive, section):
@@ -188,23 +199,32 @@ def _verify_rows(archive, checkpoint, keys, client, stream):
                       "outcome": "matched", "mismatched_fields": []}
             dest = ledger.get(key)
             try:
+                if _real(dest) and dest in conflicting[section]:
+                    result["mismatched_fields"].append("checkpoint.duplicate_destination_id")
                 if section == "memories" and record.get("memory_type") == "identity_core":
                     result["outcome"] = "protected_exclusion"
                     if dest is not None or checkpoint.skipped_memories.get(key) != "identity_core":
                         result["mismatched_fields"].append("checkpoint.protected_exclusion")
                 elif not _real(dest):
                     result["outcome"] = "unrestored"
+                    if section == "contexts":
+                        if key in cycle_blocked:
+                            result["reason"] = "blocked_by_context_cycle"
+                        result["missing_members"] = [
+                            mid for mid in (record.get("memory_ids") or []) if mid not in mapped
+                        ]
+                        result["missing_description_references"] = [
+                            mid for mid in importer._description_ids(record, aliases) if mid not in mapped
+                        ]
                     if isinstance(dest, str) and dest.startswith(importer.SKIP_SENTINEL_PREFIX):
                         result["checkpoint_disposition"] = dest
                 elif section in ("memories", "contexts"):
                     result["destination_id"] = dest
-                    if destinations[dest] != 1:
-                        result["mismatched_fields"].append("checkpoint.duplicate_destination_id")
                     stored = _get(client, "/memories/" + quote(dest, safe=""))
                     if section == "memories":
                         _memory(record, stored, dest, result)
                     else:
-                        _context(record, stored, dest, mapped, checkpoint, source_ids, result)
+                        _context(record, stored, dest, mapped, checkpoint, source_ids, aliases, result)
                 elif section == "relationships":
                     result["destination_id"] = dest
                     _edge(record, _get(client, "/relationships/" + quote(dest, safe="")), dest, mapped, result)

@@ -186,3 +186,169 @@ def test_context_readback_checks_source_metadata_and_serialized_name_and_count(t
         else:
             importer.run_zip_contexts_phase(archive, api, cp, tmp_path / "cp")
             assert cp.contexts == {"ctx": "destination"}
+
+
+class ContextDestination:
+    def __init__(self):
+        self.rows = {}
+
+    def destination_identity(self):
+        return "context-test"
+
+    def create_memory(self, **fields):
+        import uuid
+        dest = str(uuid.UUID(int=100 + len(self.rows)))
+        self.rows[dest] = dict(fields, id=dest, metadata=fields.get("metadata") or {})
+        return dest
+
+    def _readback(self, path):
+        return self.rows[path.rsplit("/", 1)[-1]]
+
+    def request(self, method, path):
+        assert method == "GET"
+        return {"data": self._readback(path)}
+
+
+def write_archive(tmp_path, **rows):
+    file = tmp_path / "references.zip"
+    with zipfile.ZipFile(file, "w") as archive:
+        counts = {section: len(rows.get(section, [])) for section in importer.ZIP_SECTIONS}
+        archive.writestr("manifest.json", json.dumps({
+            "schema_version": "1.0", "source_tenant_id": "test", "counts": counts,
+        }))
+        for section in counts:
+            # Ensure diagnostics refer to physical source lines, even with a blank line.
+            records = "\n" + "\n".join(map(json.dumps, rows.get(section, [])))
+            archive.writestr(section + ".jsonl", records)
+    return file
+
+
+def description_archive(tmp_path, dependencies):
+    import uuid
+    ids = [str(uuid.UUID(int=n + 1)) for n in range(len(dependencies) + 1)]
+    rows = [
+        context(ids[n], None, description=" / ".join("memory_id: " + ids[i] for i in dep))
+        for n, dep in enumerate(dependencies)
+    ]
+    return write_archive(tmp_path, contexts=rows), ids
+
+
+def test_description_forward_reference_only_uses_destination_ids(tmp_path):
+    from tools.verify_restore import verify_restore
+    file, ids = description_archive(tmp_path, [[1, 1], []])
+    api = ContextDestination()
+    assert importer.run_zip_import(file, api) == 0
+    cp_path = tmp_path / importer.ZIP_CHECKPOINT_FILENAME
+    checkpoint = importer.ZipCheckpoint.load(cp_path)
+    origin = api.rows[checkpoint.contexts[ids[0]]]
+    target = checkpoint.contexts[ids[1]]
+    assert json.loads(origin["content"])["description"] == f"memory_id: {target} / memory_id: {target}"
+    assert importer.run_zip_import(file, api) == 0
+    assert len(api.rows) == 2
+    result = verify_restore(file, cp_path, tmp_path / "verified.jsonl", api)
+    assert result["outcomes"] == {"matched": 2}
+
+
+def test_description_cycles_and_absent_reference_have_exact_row_diagnostics(tmp_path, capsys, caplog):
+    from tools.verify_restore import verify_restore
+    file, ids = description_archive(tmp_path, [[1], [], [2], [4], [3], [3], [7]])
+    api = ContextDestination()
+    assert importer.run_zip_import(file, None, dry_run=True) == 0
+    preview = capsys.readouterr().out
+    for i in (2, 3, 4, 5):
+        assert f"contexts.jsonl line {i + 2} ({ids[i]}): blocked by context cycle" in preview
+    assert f"contexts.jsonl line 8 ({ids[6]}): partial context" in preview
+    assert importer.run_zip_import(file, api) == 2
+    assert len(api.rows) == 3
+    for i in (2, 3, 4, 5):
+        assert f"contexts.jsonl line {i + 2} ({ids[i]}): blocked by context cycle" in caplog.text
+    path = tmp_path / importer.ZIP_CHECKPOINT_FILENAME
+    assert importer.run_zip_import(file, api) == 2
+    assert len(api.rows) == 3
+    result = verify_restore(file, path, tmp_path / "verify.jsonl", api)
+    assert result["outcomes"] == {"matched": 2, "unrestored": 4, "partial_source": 1}
+    verified = {r["source_key"]: r for r in map(json.loads, (tmp_path / "verify.jsonl").read_text().splitlines())}
+    assert verified[ids[6]]["missing_description_references"] == [ids[7]]
+    assert verified[ids[2]]["missing_description_references"] == [ids[2]]
+    assert {i for i, key in enumerate(ids) if verified.get(key, {}).get("reason") == "blocked_by_context_cycle"} == {2, 3, 4, 5}
+
+
+def test_legacy_context_receipt_with_stale_forward_id_cannot_complete(tmp_path):
+    from tools.verify_restore import verify_restore
+    file, ids = description_archive(tmp_path, [[1], []])
+    api = ContextDestination()
+    assert importer.run_zip_import(file, api) == 0
+    path = tmp_path / importer.ZIP_CHECKPOINT_FILENAME
+    checkpoint = json.loads(path.read_text())
+    del checkpoint["context_description_checks"]
+    path.write_text(json.dumps(checkpoint))
+    first = api.rows[checkpoint["contexts"][ids[0]]]
+    old = json.loads(first["content"])
+    old["description"] = f"memory_id: {ids[1]}"
+    first["content"] = json.dumps(old)
+    assert importer.run_zip_import(file, api) == 2
+    assert len(api.rows) == 2
+    result = verify_restore(file, path, tmp_path / "verify.jsonl", api)
+    assert result["outcomes"] == {"mismatch": 1, "matched": 1}
+    old["description"] = "memory_id: " + checkpoint["contexts"][ids[1]]
+    first["content"] = json.dumps(old)
+    assert importer.run_zip_import(file, api) == 0
+    assert len(api.rows) == 2
+
+
+def test_description_failed_memory_recovers_on_retry_and_clears_ledger(tmp_path, monkeypatch):
+    from tools.verify_restore import verify_restore
+    source = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    file = write_archive(
+        tmp_path, memories=[{"id": source, "content": "record"}],
+        contexts=[context("child", None, description="memory_id: " + source.upper())],
+    )
+    api = ContextDestination()
+    path = tmp_path / importer.ZIP_CHECKPOINT_FILENAME
+    with monkeypatch.context() as block:
+        block.setattr(api, "create_memory", Mock(side_effect=importer.APIError(422, "rejected", "/memories")))
+        assert importer.run_zip_import(file, api) == 2
+    cp = importer.ZipCheckpoint.load(path)
+    assert cp.context_unresolved_descriptions == {"child": [source]}
+    assert cp.failed_contexts == ["child"] and not cp.contexts
+    assert verify_restore(file, path, tmp_path / "before.jsonl", api)["outcomes"] == {"unrestored": 2}
+
+    assert importer.run_zip_import(file, api) == 0
+    assert importer.run_zip_import(file, api) == 0
+    assert len(api.rows) == 2
+    cp = importer.ZipCheckpoint.load(path)
+    restored = json.loads(api.rows[cp.contexts["child"]]["content"])
+    assert restored["description"] == "memory_id: " + cp.memory_id_map[source]
+    assert not cp.context_unresolved and not cp.context_unresolved_descriptions and not cp.failed_contexts
+    assert verify_restore(file, path, tmp_path / "after.jsonl", api)["outcomes"] == {"matched": 2}
+
+
+def test_mixed_context_cycle_and_dependency_on_partial_protected_reference(tmp_path, capsys):
+    from tools.verify_restore import verify_restore
+    first = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    protected = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    rows = [
+        context(first, ["second"]),
+        context("second", None, description="memory_id: " + first),
+        context("downstream", ["partial"]),
+        context("partial", None, description="memory_id: " + protected),
+    ]
+    file = write_archive(tmp_path, contexts=rows,
+                         memories=[{"id": protected, "content": "identity", "memory_type": "identity_core"}])
+    api = ContextDestination()
+    assert importer.run_zip_import(file, None, dry_run=True) == 0
+    preview = capsys.readouterr().out
+    assert f"line 2 ({first}): blocked by context cycle. memory_ids=second" in preview
+    assert f"line 3 (second): blocked by context cycle. description memory_id={first}" in preview
+    assert importer.run_zip_import(file, api) == 2
+    assert importer.run_zip_import(file, api) == 2
+    assert len(api.rows) == 2
+    path = tmp_path / importer.ZIP_CHECKPOINT_FILENAME
+    cp = importer.ZipCheckpoint.load(path)
+    assert cp.context_unresolved == {first: ["second"]}
+    assert cp.context_unresolved_descriptions == {"second": [first], "partial": [protected]}
+    assert json.loads(api.rows[cp.contexts["partial"]]["content"])["description"] == "memory_id: " + protected
+    assert json.loads(api.rows[cp.contexts["downstream"]]["content"])["memory_ids"] == [cp.contexts["partial"]]
+    assert verify_restore(file, path, tmp_path / "result.jsonl", api)["outcomes"] == {
+        "protected_exclusion": 1, "unrestored": 2, "partial_source": 1, "matched": 1,
+    }

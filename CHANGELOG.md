@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [2.0.1] - Unreleased
 
+- Check incremental Git additions against committed content and treat same-note heading links as local navigation.
+- Remap explicit context-description references in dependency order and name cyclic or missing references in preview and verification.
+- Distinguish JSON booleans from numbers in write-time comparisons, verify the ownership of shared destination IDs and use API defaults for null optional relationship fields.
+
 - Validate ZIP records and payloads before writing. Restore nested contexts in dependency order and report unresolved membership.
 - Bind recovery to input and destination, journal writes, lock state and return a failing status for incomplete restores. Preserve recovery state during preview.
 - Read back memory and relationship fields, artifact content and document bytes. Separate identical existing objects from conflicting ones.

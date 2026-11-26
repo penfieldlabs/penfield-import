@@ -33,7 +33,7 @@ from email.utils import parsedate_to_datetime
 import urllib.error
 import urllib.request
 from penfield_io import checkpoint_lock, open_request, origin, write_json_atomic
-from collections import deque
+from collections import Counter, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -322,6 +322,9 @@ class Checkpoint:
             mapping = data.get(key, {})
             if not isinstance(mapping, dict) or not all(isinstance(v, str) and v for v in mapping.values()):
                 raise ValueError(f"Invalid vault checkpoint field {key}")
+        document_ids = [v for v in data.get("documents", {}).values() if not v.startswith(SKIP_SENTINEL_PREFIX)]
+        if len(set(document_ids)) != len(document_ids):
+            raise ValueError("Vault checkpoint contains repeated document destination IDs")
         for key in ("relationships_done", "failed_memories", "failed_artifacts", "failed_documents",
                     "failed_vault_artifacts", "failed_relationships", "unresolved_links"):
             values = data.get(key, [])
@@ -414,37 +417,65 @@ def _git_head_sha(vault_path: Path) -> Optional[str]:
     return None
 
 
-def _git_new_files_since(vault_path: Path, since_sha: str) -> list[str]:
+def _git_new_files_since(vault_path: Path, since_sha: str, end_sha: str = "HEAD") -> list[str]:
     """Return added vault input paths exactly as stored by Git."""
     result = subprocess.run(
-        ["git", "diff", "--relative", "--name-only", "-z", "--diff-filter=A", since_sha, "HEAD", "--", "."],
+        ["git", "diff", "--relative", "--raw", "-z", "--no-renames", "--diff-filter=A", since_sha, end_sha, "--", "."],
         capture_output=True, timeout=30, cwd=vault_path,
     )
     if result.returncode:
         raise ValueError("Cannot determine changes since the checkpoint's git commit")
     exts = {pattern[1:] for pattern in SUPPORTED_EXTENSIONS}
-    paths = (Path(os.fsdecode(raw)) for raw in result.stdout.split(b"\0") if raw)
+    fields = result.stdout.split(b"\0")
+    paths = (Path(os.fsdecode(raw)) for header, raw in zip(fields[::2], fields[1::2])
+             if header.split()[1] in (b"100644", b"100755"))
     return [p.as_posix() for p in paths if p.suffix.lower() in exts or p.parts[0] in {"Documents", "Artifacts"}]
 
 
-def _are_committed_additions(vault_path: Path, new_paths: set[str], git_paths: set[str]) -> bool:
-    """Git on macOS can store a different Unicode spelling from readdir()."""
-    unmatched = new_paths - git_paths
-    if not unmatched:
-        return True
+def _git_text_checkout_is_crlf(vault_path: Path, path: str) -> bool:
+    result = subprocess.run(
+        ["git", "--literal-pathspecs", "ls-files", "--eol", "-z", "--", path],
+        cwd=vault_path, capture_output=True, timeout=30,
+    )
+    info, separator, name = result.stdout.partition(b"\t")
+    fields = info.split()
+    return (result.returncode == 0 and separator == b"\t" and name == os.fsencode(path) + b"\0"
+            and fields[:2] == [b"i/lf", b"w/crlf"] and b"attr/-text" not in fields and b"eol=lf" not in fields)
+
+
+def _verify_committed_additions(vault_path: Path, hashes: dict[str, str], git_paths: set[str], commit: str) -> None:
+    """Accept the pinned blob or its deterministic LF-to-CRLF expansion for text."""
+    new_paths = set(hashes)
     candidates: dict[str, list[str]] = {}
     for path in git_paths - new_paths:
         candidates.setdefault(unicodedata.normalize("NFC", path), []).append(path)
-    for path in unmatched:
-        choices = candidates.pop(unicodedata.normalize("NFC", path), [])
-        if len(choices) != 1:
-            return False
-        try:
-            if not (vault_path / path).samefile(vault_path / choices[0]):
-                return False
-        except FileNotFoundError:
-            return False
-    return True
+    for path, digest in hashes.items():
+        stored_path = path
+        if path not in git_paths:
+            # On macOS Git may precompose a filename returned decomposed by readdir().
+            choices = candidates.pop(unicodedata.normalize("NFC", path), [])
+            if (len(choices) != 1 or not (vault_path / choices[0]).is_file()
+                    or not (vault_path / path).samefile(vault_path / choices[0])):
+                raise ValueError(f"Vault input is not a committed addition: {path}")
+            stored_path = choices[0]
+        spec = f"{commit}:./{stored_path}"
+        with tempfile.TemporaryFile() as blob:
+            status = subprocess.run(["git", "cat-file", "blob", spec], cwd=vault_path, stdout=blob,
+                                    stderr=subprocess.PIPE, timeout=30)
+            if status.returncode:
+                raise ValueError(f"Cannot read committed vault input: {path}")
+            blob.seek(0)
+            committed = hashlib.sha256()
+            crlf = hashlib.sha256()
+            plain_lf = True
+            for chunk in iter(lambda: blob.read(1024 * 1024), b""):
+                committed.update(chunk)
+                plain_lf = plain_lf and b"\x00" not in chunk and b"\r" not in chunk
+                if plain_lf:
+                    crlf.update(chunk.replace(b"\n", b"\r\n"))
+            if (committed.hexdigest() != digest and not (
+                    plain_lf and crlf.hexdigest() == digest and _git_text_checkout_is_crlf(vault_path, stored_path))):
+                raise ValueError(f"Vault input differs from its committed bytes: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -766,9 +797,9 @@ class PenfieldClient:
             if field == "tags":
                 wanted = sorted({normalize_tag(tag) for tag in wanted})
                 actual = sorted(actual) if isinstance(actual, list) else None
-            if field == "metadata" and isinstance(actual, dict):
-                actual = {key: actual.get(key) for key in wanted if key in actual}
-            if actual != wanted:
+            matches = (_source_object_matches(wanted, actual) if field == "metadata"
+                       else _json_values_equal(actual, wanted))
+            if not matches:
                 raise APIError(0, f"Memory readback differs in {field}", path)
         if stored.get("id") != memory_id:
             raise APIError(0, "Memory ID mismatch", path)
@@ -861,10 +892,7 @@ class PenfieldClient:
                 stored = self._readback(path)
                 media_type = stored.get("content_type") or stored.get("mime_type")
                 stored_metadata = stored.get("metadata")
-                metadata_matches = not metadata or (
-                    isinstance(stored_metadata, dict)
-                    and all(k in stored_metadata and stored_metadata[k] == v for k, v in metadata.items())
-                )
+                metadata_matches = not metadata or _source_object_matches(metadata, stored_metadata)
                 if (stored.get("id") != doc_id or stored.get("filename") != filename
                         or (content_type != "application/octet-stream" and media_type != content_type)
                         or not metadata_matches):
@@ -1011,9 +1039,9 @@ class PenfieldClient:
             actual = stored.get(key)
             if key == "relationship_metadata":
                 actual = stored.get("metadata", actual)
-            if isinstance(value, dict) and isinstance(actual, dict):
-                actual = {k: actual[k] for k in value if k in actual}
-            if actual != value:
+            matches = (_source_object_matches(value, actual) if isinstance(value, dict) and key in {"relationship_metadata", "evidence"}
+                       else _json_values_equal(actual, value))
+            if not matches:
                 return False
         return True
 
@@ -1794,8 +1822,9 @@ def run_documents_phase(
                 result = client.upload_document_bytes(filepath.name, data, content_type=mime,
                                                      metadata={"vault_path": doc_key})
                 doc_id = result.get("id") or result.get("document_id")
-                if not isinstance(doc_id, str) or not doc_id:
-                    raise ValueError(f"Document write returned no ID for {doc_key}; reconcile the destination")
+                if (not isinstance(doc_id, str) or not doc_id.strip() or doc_id.startswith(SKIP_SENTINEL_PREFIX)
+                        or doc_id in checkpoint.documents.values()):
+                    raise ValueError(f"Missing or repeated document receipt for {doc_key}; reconcile the destination")
             checkpoint.documents[doc_key] = doc_id
             checkpoint.record_processing(doc_key, result)
             if doc_key in checkpoint.failed_documents:
@@ -1833,6 +1862,7 @@ def build_relationship_list(
         if v and not v.startswith(SKIP_SENTINEL_PREFIX)
     }
     result: dict[str, dict[str, Any]] = {}
+    local_navigation: set[str] = set()
 
     for note in notes:
         from_id = memory_lookup.get(note.rel_path)
@@ -1840,9 +1870,17 @@ def build_relationship_list(
             continue
 
         for target_filename, rel_type in note.relationships:
-            target = target_filename.split("#", 1)[0] or note.rel_path
-            options = candidates.get(unicodedata.normalize("NFC", target), set())
+            target = target_filename.split("#", 1)[0]
+            options = candidates.get(unicodedata.normalize("NFC", target), set()) if target else {note.rel_path}
             target_relpath = next(iter(options)) if len(options) == 1 else None
+            if target_relpath == note.rel_path:
+                if "#" in target_filename:
+                    local_navigation.add(f"{note.rel_path}|{note.rel_path}|{rel_type}")
+                else:
+                    issue = f"{note.rel_path} -> {target_filename} ({rel_type}): self-relationships are unsupported"
+                    logger.warning("%s", issue)
+                    checkpoint.unresolved_links.append(issue)
+                continue
             to_id = memory_lookup.get(target_relpath) if target_relpath else None
             if not to_id:
                 issue = f"{note.rel_path} -> {target_filename} ({rel_type})"
@@ -1857,6 +1895,8 @@ def build_relationship_list(
                 "relationship_type": rel_type,
             }
 
+    # Earlier restores could leave a rejected self-edge for a local heading.
+    checkpoint.failed_relationships = [key for key in checkpoint.failed_relationships if key not in local_navigation]
     return list(result.items())
 
 
@@ -2003,16 +2043,12 @@ def dry_run_report(notes: list[ParsedNote], args: argparse.Namespace, *,
             brackets["100K+"] += 1
 
     # Relationship stats
-    all_rels: list[tuple[str, str]] = []
     preview = Checkpoint(memories={n.rel_path: str(i) for i, n in enumerate(notes)
                                    if format_memory_content(n, incl_fm).strip()})
     resolvable = build_relationship_list(notes, preview)
-    for n in notes:
-        for target, rel_type in n.relationships:
-            all_rels.append((target, rel_type))
-
     rel_type_counts: dict[str, int] = {}
-    for _, rel_type in all_rels:
+    for _, payload in resolvable:
+        rel_type = payload["relationship_type"]
         rel_type_counts[rel_type] = rel_type_counts.get(rel_type, 0) + 1
 
     # Directory breakdown
@@ -2028,7 +2064,7 @@ def dry_run_report(notes: list[ParsedNote], args: argparse.Namespace, *,
 
     print(f"Total notes:       {total}")
     print(f"Oversized (>10K):  {len(oversized)}")
-    print(f"Relationships:     {len(all_rels)}")
+    print(f"Relationships:     {len(resolvable)}")
     print(f"Rel. mode:         {getattr(args, 'relationships', 'frontmatter')}")
     print()
 
@@ -2074,9 +2110,8 @@ def dry_run_report(notes: list[ParsedNote], args: argparse.Namespace, *,
     print(f"  Memories to create:      {nonempty}")
     print(f"  Artifacts to upload:     {len(oversized) + artifact_count}")
     print(f"  Documents to upload:     {document_count}")
-    rel_batches = (len(all_rels) + BULK_RELATIONSHIP_BATCH_SIZE - 1) // BULK_RELATIONSHIP_BATCH_SIZE if all_rels else 0
-    print(f"  Relationship batches:    {rel_batches} ({len(all_rels)} total)")
-    print(f"  Resolvable rels:         {len(resolvable)}")
+    rel_batches = (len(resolvable) + BULK_RELATIONSHIP_BATCH_SIZE - 1) // BULK_RELATIONSHIP_BATCH_SIZE
+    print(f"  Relationship batches:    {rel_batches} ({len(resolvable)} total)")
     print()
 
     print("NOTE: Oversized notes get a truncated/summarized memory (searchable) plus")
@@ -2127,6 +2162,8 @@ class ZipCheckpoint:
     relationship_traversal: dict[str, str] = field(default_factory=dict)
     skipped_relationships: dict[str, str] = field(default_factory=dict)
     context_unresolved: dict[str, list[str]] = field(default_factory=dict)
+    context_unresolved_descriptions: dict[str, list[str]] = field(default_factory=dict)
+    context_description_checks: dict[str, str] = field(default_factory=dict)
     in_flight: dict[str, Any] = field(default_factory=dict)
     write_keys: list[str] = field(default_factory=list, repr=False, compare=False)
 
@@ -2155,7 +2192,7 @@ class ZipCheckpoint:
             elif isinstance(default, list) and not all(isinstance(v, str) for v in value):
                 raise ValueError(f"Invalid ZIP checkpoint list: {key}")
             elif isinstance(default, dict) and key not in {
-                "context_unresolved", "in_flight", "document_processing", "document_tag_omissions",
+                "context_unresolved", "context_unresolved_descriptions", "in_flight", "document_processing", "document_tag_omissions",
             }:
                 if not all(isinstance(v, str) and v for v in value.values()):
                     raise ValueError(f"Invalid ZIP checkpoint mapping: {key}")
@@ -2166,8 +2203,11 @@ class ZipCheckpoint:
                for item in checkpoint.document_processing.values()):
             raise ValueError("Invalid document processing receipt")
         if any(not isinstance(ids, list) or any(not isinstance(mid, str) for mid in ids)
-               for ids in checkpoint.context_unresolved.values()):
-            raise ValueError("Invalid ZIP checkpoint unresolved context membership")
+               for ledger in (checkpoint.context_unresolved, checkpoint.context_unresolved_descriptions)
+               for ids in ledger.values()):
+            raise ValueError("Invalid ZIP checkpoint unresolved context references")
+        if any(state not in {"matched", "mismatch", "unverified"} for state in checkpoint.context_description_checks.values()):
+            raise ValueError("Invalid ZIP checkpoint context description check")
         if any(not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags)
                for tags in checkpoint.document_tag_omissions.values()):
             raise ValueError("Invalid ZIP checkpoint document tag omissions")
@@ -2198,7 +2238,9 @@ class ZipCheckpoint:
                 and set(self.identical_relationships) <= self.relationships_done
                 and self.relationship_id_map.keys() <= self.relationships_done
                 and self.relationship_traversal.keys() <= self.relationships_done
-                and self.context_unresolved.keys() <= keys["contexts"]):
+                and self.context_unresolved.keys() <= keys["contexts"]
+                and self.context_unresolved_descriptions.keys() <= keys["contexts"]
+                and self.context_description_checks.keys() <= self.contexts.keys()):
             raise ValueError("Checkpoint has orphaned verification outcomes")
 
     def save(self, path: Path) -> None:
@@ -2391,9 +2433,10 @@ def validate_zip_manifest(zf: zipfile.ZipFile, source_keys: Optional[dict[str, s
     # shape before any writes, including forward references to other contexts.
     placeholder = "00000000-0000-0000-0000-000000000000"
     placeholder_ids = dict.fromkeys(transferable, placeholder)
+    aliases = _context_uuid_aliases(transferable)
     for number, record in _zip_records(zf, "contexts"):
         members = [placeholder for mid in (record.get("memory_ids") or []) if mid in placeholder_ids]
-        if len(_zip_context_content(record, members, placeholder_ids)) > MEMORY_CONTENT_LIMIT:
+        if len(_zip_context_content(record, members, placeholder_ids, aliases)) > MEMORY_CONTENT_LIMIT:
             raise ValueError(f"contexts.jsonl line {number}: serialized context exceeds memory content limit")
     corrupt = zf.testzip()
     if corrupt:
@@ -2468,12 +2511,60 @@ def _json_values_equal(left: Any, right: Any) -> bool:
     return left == right
 
 
+def _source_object_matches(wanted: dict, actual: Any) -> bool:
+    """The server may add top-level metadata/evidence keys. Every supplied value must match."""
+    if actual is None:
+        return not wanted
+    return isinstance(actual, dict) and all(
+        key in actual and _json_values_equal(value, actual[key]) for key, value in wanted.items())
+
+
 def _traversal_status(wanted: dict, stored: dict) -> str:
     if not wanted.get("traversal_properties"):
         return "matched"
     if "traversal_properties" not in stored:
         return "unobservable"
     return "matched" if _json_values_equal(stored["traversal_properties"], wanted["traversal_properties"]) else "mismatch"
+
+
+def _zip_relationship_payload(record: dict) -> dict:
+    payload = {key: record[key] for key in ("from_id", "to_id", "relationship_type")}
+    # The export can encode an optional field as null. Omission selects the API default.
+    for key in ("direction_type", "strength", "confidence", "evidence"):
+        if record.get(key) is not None:
+            payload[key] = record[key]
+    for key in ("inverse_type", "traversal_properties"):
+        if record.get(key):
+            payload[key] = record[key]
+    if record.get("metadata"):
+        payload["relationship_metadata"] = record["metadata"]
+    return payload
+
+
+def _zip_conflicting_destinations(archive: zipfile.ZipFile, state: ZipCheckpoint) -> dict[str, set[str]]:
+    """Find receipts that claim more independently created records than the destination holds."""
+    def duplicates(values):
+        counts = Counter(value for value in values if not value.startswith(SKIP_SENTINEL_PREFIX))
+        return {value for value, count in counts.items() if count > 1}
+
+    memories = duplicates([*state.memory_id_map.values(), *state.contexts.values()])
+    conflicts = {"memories": memories, "contexts": memories, "documents": duplicates(state.documents.values()),
+                 "relationships": set(), "artifacts": set()}
+    shared = duplicates(state.relationship_id_map.values())
+    if not shared:
+        return conflicts
+    # A conflicting create can share an edge only after the client verified it was identical.
+    existing = set(state.identical_relationships)
+    new_receipts = Counter(rid for key, rid in state.relationship_id_map.items() if key not in existing)
+    conflicts["relationships"].update(rid for rid in shared if new_receipts[rid] > 1)
+    first_payload = {}
+    for _, record in _zip_records(archive, "relationships"):
+        rid = state.relationship_id_map.get(record["id"])
+        if rid in shared:
+            payload = _zip_relationship_payload(record)
+            if not _json_values_equal(first_payload.setdefault(rid, payload), payload):
+                conflicts["relationships"].add(rid)
+    return conflicts
 
 
 def run_zip_relationships_phase(
@@ -2494,6 +2585,19 @@ def run_zip_relationships_phase(
         checkpoint.write_keys = keys
         try:
             receipt = client.create_relationships_bulk([payload for _, payload in batch])
+            if isinstance(receipt, dict) and receipt.get("existing_identical") is True:
+                # Conflict reconciliation returns one source and one existing destination.
+                rid = receipt["verified_ids"][0]
+                owners = {source for source, dest in checkpoint.relationship_id_map.items() if dest == rid}
+                if owners:
+                    expected = batch[0][1]
+                    for _, prior in _zip_records(zf, "relationships"):
+                        if prior["id"] in owners:
+                            previous = _zip_relationship_payload(prior)
+                            previous.update(from_id=endpoint(prior["from_id"]), to_id=endpoint(prior["to_id"]))
+                            if not _json_values_equal(previous, expected):
+                                raise APIError(412, "Source relationship payloads differ for this shared receipt",
+                                               "/relationships/bulk")
         except APIError as exc:
             if len(batch) > 1 and exc.status_code in (400, 409, 422):
                 for entry in batch:
@@ -2535,25 +2639,8 @@ def run_zip_relationships_phase(
             continue
         checkpoint.skipped_relationships.pop(source_id, None)
 
-        payload: dict[str, Any] = {
-            "from_id": new_from,
-            "to_id": new_to,
-            "relationship_type": rec["relationship_type"],
-        }
-        if "direction_type" in rec:
-            payload["direction_type"] = rec["direction_type"]
-        if "inverse_type" in rec and rec["inverse_type"]:
-            payload["inverse_type"] = rec["inverse_type"]
-        if "strength" in rec:
-            payload["strength"] = rec["strength"]
-        if "confidence" in rec:
-            payload["confidence"] = rec["confidence"]
-        if rec.get("evidence") is not None:
-            payload["evidence"] = rec["evidence"]
-        if rec.get("traversal_properties"):
-            payload["traversal_properties"] = rec["traversal_properties"]
-        if "metadata" in rec and rec["metadata"]:
-            payload["relationship_metadata"] = rec["metadata"]
+        payload = _zip_relationship_payload(rec)
+        payload.update(from_id=new_from, to_id=new_to)
 
         if done:
             rid = checkpoint.relationship_id_map.get(source_id)
@@ -2576,10 +2663,65 @@ def run_zip_relationships_phase(
     checkpoint.save(checkpoint_path)
 
 
-def _zip_context_content(rec: dict[str, Any], members: list[str], mapped: dict[str, str]) -> str:
-    description = re.sub(
-        r"(\bmemory_id:\s*)([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})(?![0-9a-fA-F])",
-        lambda match: match[1] + mapped.get(match[2], match[2]),
+_CONTEXT_MEMORY_TOKEN = re.compile(
+    r"(\bmemory_id:\s*)([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})(?![0-9a-fA-F])"
+)
+
+
+def _context_uuid_aliases(keys):
+    # The source ID itself is kept for receipts. Textual UUID tokens may use
+    # either case. An ambiguous spelling must never select the wrong row.
+    aliases = {}
+    for key in keys:
+        folded = key.lower()
+        if aliases.setdefault(folded, key) != key:
+            aliases[folded] = None
+    return {key: value for key, value in aliases.items() if value is not None}
+
+
+def _description_ids(record, aliases):
+    return [
+        aliases.get(match[2].lower(), match[2])
+        for match in _CONTEXT_MEMORY_TOKEN.finditer(record.get("description") or "")
+    ]
+
+
+def _context_schedule(rows, mapped, aliases):
+    """Return topological order and all rows blocked by a cycle, including dependents."""
+    dependencies = {}
+    for key, (_, record) in rows.items():
+        if key not in mapped:
+            refs = (record.get("memory_ids") or []) + _description_ids(record, aliases)
+            dependencies[key] = list(dict.fromkeys(mid for mid in refs if mid in rows and mid not in mapped))
+    order = graphlib.TopologicalSorter(dependencies)
+    try:
+        order.prepare()
+    except graphlib.CycleError:
+        pass  # get_ready() still returns every independent acyclic row.
+    ready_keys = []
+    while ready := order.get_ready():
+        ready_keys.extend(ready)
+        order.done(*ready)
+    return ready_keys, dependencies.keys() - set(ready_keys)
+
+
+def _context_row_diagnostic(line, key, reason, members, descriptions):
+    details = []
+    if members:
+        details.append("memory_ids=" + ", ".join(members))
+    if descriptions:
+        details.append("description memory_id=" + ", ".join(descriptions))
+    message = f"contexts.jsonl line {line} ({key}): {reason}"
+    return message + ". " + "; ".join(details) if details else message
+
+
+def _zip_context_content(
+    rec: dict[str, Any], members: list[str], mapped: dict[str, str], aliases: Optional[dict[str, str]] = None,
+) -> str:
+    if aliases is None:
+        aliases = _context_uuid_aliases(mapped)
+    description = _CONTEXT_MEMORY_TOKEN.sub(
+        lambda match: match[1] + mapped.get(aliases.get(match[2].lower(), match[2]), match[2]),
         rec.get("description") or "",
     )
     return json.dumps({
@@ -2598,54 +2740,86 @@ def run_zip_contexts_phase(
     """Recreate contexts as checkpoint memories with remapped IDs."""
     checkpoint.phase = "contexts"
 
-    # The full context graph is needed to resolve forward references and cycles.
-    by_id = {r["id"]: r for _, r in _zip_records(zf, "contexts")}
+    rows = {r["id"]: (line, r) for line, r in _zip_records(zf, "contexts")}
     source_memories = {r["id"] for _, r in _zip_records(zf, "memories")}
+    aliases = _context_uuid_aliases(rows.keys() | source_memories)
     mapped = dict(checkpoint.memory_id_map)
     mapped.update({
         key: value for key, value in checkpoint.contexts.items()
         if value and not value.startswith(SKIP_SENTINEL_PREFIX)
     })
-    pending = {key: rec for key, rec in by_id.items() if key not in mapped}
 
-    def record_failure(key: str, unresolved: list[str]) -> None:
+    def record_issues(key, missing_members, missing_description_ids):
+        for ledger, missing in ((checkpoint.context_unresolved, missing_members),
+                                (checkpoint.context_unresolved_descriptions, missing_description_ids)):
+            if missing:
+                ledger[key] = missing
+            else:
+                ledger.pop(key, None)
         if key not in checkpoint.failed_contexts:
             checkpoint.failed_contexts.append(key)
-        if unresolved:
-            checkpoint.context_unresolved[key] = unresolved
         checkpoint.save(checkpoint_path)
 
-    order = graphlib.TopologicalSorter({
-        key: [mid for mid in (rec.get("memory_ids") or []) if mid in pending]
-        for key, rec in pending.items()
-    })
-    try:
-        order.prepare()
-    except graphlib.CycleError:
-        # The acyclic part can still be restored with validated member IDs.
-        logger.warning("Context dependency cycle found in export")
+    def clear_issues(key):
+        checkpoint.context_unresolved.pop(key, None)
+        checkpoint.context_unresolved_descriptions.pop(key, None)
+        if key in checkpoint.failed_contexts:
+            checkpoint.failed_contexts.remove(key)
 
-    def restore(key: str, rec: dict[str, Any]) -> None:
-        name = rec.get("name", "")
+    # Old write receipts did not establish that forward description tokens
+    # were mapped. Read those contexts before accepting the existing IDs.
+    for key, (line, rec) in rows.items():
+        refs = _description_ids(rec, aliases)
+        if key not in mapped or not refs:
+            continue
+        previously_unmapped = checkpoint.context_unresolved_descriptions.get(key, ())
+        if (checkpoint.context_description_checks.get(key) == "matched"
+                and not any(mid in mapped for mid in previously_unmapped)):
+            continue
+        missing_tokens = [mid for mid in refs if mid not in mapped]
+        missing_members = [mid for mid in (rec.get("memory_ids") or []) if mid not in mapped]
+        expected = json.loads(_zip_context_content(rec, [], mapped, aliases))["description"]
+        path = "/memories/" + urllib.parse.quote(mapped[key], safe="")
+        stored = client._readback(path)
+        try:
+            content = json.loads(stored["content"])
+            correct = stored.get("id") == mapped[key] and content["description"] == expected
+        except (ValueError, KeyError, TypeError):
+            correct = False
+        checkpoint.context_description_checks[key] = "matched" if correct else "mismatch"
+        if not correct or missing_tokens or missing_members:
+            reason = "stored description differs from its mapped source" if not correct else "unavailable references"
+            logger.warning(_context_row_diagnostic(line, key, reason, missing_members, missing_tokens))
+            record_issues(key, missing_members, missing_tokens)
+        else:
+            clear_issues(key)
+        checkpoint.save(checkpoint_path)
+
+    def restore(key):
+        line, rec = rows[key]
+        name = rec["name"]
         original_ids = rec.get("memory_ids") or []
+        description_ids = _description_ids(rec, aliases)
         unresolved = [mid for mid in original_ids if mid not in mapped]
-        if any(mid in by_id or (mid in source_memories and mid not in checkpoint.skipped_memories)
-               for mid in unresolved):
-            logger.error("Context %r has unresolved import dependencies", name)
-            record_failure(key, unresolved)
+        missing_tokens = [mid for mid in description_ids if mid not in mapped]
+        if any(mid in rows or (mid in source_memories and mid not in checkpoint.skipped_memories)
+               for mid in unresolved + missing_tokens):
+            logger.error(_context_row_diagnostic(line, key, "unresolved import dependencies", unresolved, missing_tokens))
+            record_issues(key, unresolved, missing_tokens)
             return
         members = [mapped[mid] for mid in original_ids if mid in mapped]
-        if unresolved:
-            logger.warning("Context %r: %d of %d memory_ids are dangling",
-                           name, len(unresolved), len(original_ids))
-            if not members:
+        if unresolved or missing_tokens:
+            reason = (f"{len(unresolved)} of {len(original_ids)} memory_ids are dangling" if unresolved
+                      else "unavailable description references")
+            logger.warning(_context_row_diagnostic(line, key, reason, unresolved, missing_tokens))
+            if original_ids and not members:
                 checkpoint.contexts[key] = "__skipped_dangling__"
-                record_failure(key, unresolved)
+                record_issues(key, unresolved, missing_tokens)
                 return
-        context_content = _zip_context_content(rec, members, mapped)
+        context_content = _zip_context_content(rec, members, mapped, aliases)
         if len(context_content) > MEMORY_CONTENT_LIMIT:
             logger.error("Context %r exceeds the memory content limit", name)
-            record_failure(key, unresolved)
+            record_issues(key, unresolved, missing_tokens)
             return
         tags = ["context", "checkpoint"]
         name_tag = normalize_tag(name)
@@ -2663,25 +2837,26 @@ def run_zip_contexts_phase(
             logger.error("Failed to create context %r: %s", name, exc)
             if exc.status_code == 409:
                 checkpoint.contexts[key] = "__skipped_conflict__"
-            record_failure(key, unresolved)
+            record_issues(key, unresolved, missing_tokens)
             return
         checkpoint.contexts[key] = mapped[key] = new_id
-        if unresolved:
-            record_failure(key, unresolved)
+        if description_ids:
+            checkpoint.context_description_checks[key] = "matched"
+        if unresolved or missing_tokens:
+            record_issues(key, unresolved, missing_tokens)
         else:
-            checkpoint.context_unresolved.pop(key, None)
-            if key in checkpoint.failed_contexts:
-                checkpoint.failed_contexts.remove(key)
+            clear_issues(key)
             checkpoint.save(checkpoint_path)
 
-    while ready := order.get_ready():
-        for key in ready:
-            restore(key, pending.pop(key))
-            order.done(key)
-    for key, rec in pending.items():
-        unresolved = [mid for mid in rec.get("memory_ids", []) if mid not in mapped]
-        logger.error("Context %r depends on a context cycle", rec.get("name"))
-        record_failure(key, unresolved)
+    ordered, blocked = _context_schedule(rows, mapped, aliases)
+    for key in ordered:
+        restore(key)
+    for key, (line, rec) in rows.items():
+        if key in blocked:
+            missing = [mid for mid in (rec.get("memory_ids") or []) if mid not in mapped]
+            missing_tokens = [mid for mid in _description_ids(rec, aliases) if mid not in mapped]
+            logger.error(_context_row_diagnostic(line, key, "blocked by context cycle", missing, missing_tokens))
+            record_issues(key, missing, missing_tokens)
     checkpoint.save(checkpoint_path)
 
 
@@ -2897,7 +3072,9 @@ def run_zip_verify_phase(
         if section == "relationships":
             partial_keys = {key for key, status in checkpoint.relationship_traversal.items() if status != "matched"}
         elif section == "contexts":
-            partial_keys = {key for key in checkpoint.context_unresolved if key in checkpoint.contexts
+            incomplete_contexts = set(checkpoint.context_unresolved) | set(checkpoint.context_unresolved_descriptions)
+            incomplete_contexts.update(k for k, v in checkpoint.context_description_checks.items() if v != "matched")
+            partial_keys = {key for key in incomplete_contexts if key in checkpoint.contexts
                             and not checkpoint.contexts[key].startswith(SKIP_SENTINEL_PREFIX)}
         elif section == "artifacts":
             partial_keys = set(checkpoint.artifact_mime_mismatches)
@@ -2930,6 +3107,10 @@ def run_zip_verify_phase(
         if statuses.get("failed"):
             complete = False
         print(f"Document indexing: {statuses}")
+    if checkpoint.context_unresolved_descriptions:
+        count = sum(len(ids) for ids in checkpoint.context_unresolved_descriptions.values())
+        print(f"Unresolved context description references: {count}")
+        complete = False
     if checkpoint.context_unresolved:
         count = sum(len(ids) for ids in checkpoint.context_unresolved.values())
         print(f"Unresolved context memberships: {count}")
@@ -2973,6 +3154,17 @@ class _JournaledZipClient:
                 known = set(self.checkpoint.memory_id_map.values()) | set(self.checkpoint.contexts.values())
                 if not isinstance(result, str) or not result or result in known or result.startswith(SKIP_SENTINEL_PREFIX):
                     raise ValueError(f"Missing or duplicate memory receipt for {self.checkpoint.in_flight}")
+            elif name == "upload_document_bytes":
+                doc_id = result.get("id") or result.get("document_id")
+                if (not isinstance(doc_id, str) or not doc_id.strip() or doc_id.startswith(SKIP_SENTINEL_PREFIX)
+                        or doc_id in self.checkpoint.documents.values()):
+                    raise ValueError(f"Missing or duplicate document receipt for {self.checkpoint.in_flight}")
+            elif name == "create_relationships_bulk" and isinstance(result, dict) and "verified_ids" in result:
+                ids = result["verified_ids"]
+                if (len(ids) != len(self.checkpoint.write_keys) or len(ids) != len(set(ids))
+                        or (result.get("existing_identical") is not True
+                            and not set(ids).isdisjoint(self.checkpoint.relationship_id_map.values()))):
+                    raise ValueError(f"Invalid or repeated relationship create receipt for {self.checkpoint.in_flight}")
             self.checkpoint.in_flight = {}
             return result
         return guarded
@@ -2980,8 +3172,8 @@ class _JournaledZipClient:
 
 def _print_zip_preview(zf: zipfile.ZipFile) -> None:
     memories = {r["id"]: r.get("memory_type") for _, r in _zip_records(zf, "memories")}
-    contexts = {r["id"]: r.get("memory_ids") or [] for _, r in _zip_records(zf, "contexts")}
-    members = [mid for ids in contexts.values() for mid in ids]
+    contexts = {r["id"]: (n, r) for n, r in _zip_records(zf, "contexts")}
+    members = [mid for _, row in contexts.values() for mid in (row.get("memory_ids") or [])]
     absent = sum(mid not in memories and mid not in contexts for mid in members)
     print(f"Protected identity memories excluded: {sum(t == 'identity_core' for t in memories.values())}")
     print(f"Personality traits converted to facts: {sum(t == 'personality_trait' for t in memories.values())}")
@@ -2992,11 +3184,25 @@ def _print_zip_preview(zf: zipfile.ZipFile) -> None:
             print(f"  Memory {key}: excluded protected identity")
         elif kind == "personality_trait":
             print(f"  Memory {key}: imported as fact")
-    available = set(contexts) | {key for key, kind in memories.items() if kind != "identity_core"}
-    for key, member_ids in contexts.items():
-        missing = [mid for mid in member_ids if mid not in available]
-        if missing:
-            print(f"  Context {key}: unavailable members {', '.join(missing)}")
+    available = {key for key, kind in memories.items() if kind != "identity_core"}
+    aliases = _context_uuid_aliases(contexts.keys() | memories.keys())
+    ordered, blocked = _context_schedule(contexts, available, aliases)
+    for key in ordered + [k for k in contexts if k in blocked]:
+        number, row = contexts[key]
+        ids = row.get("memory_ids") or []
+        missing = [mid for mid in ids if mid not in available]
+        tokens = [mid for mid in _description_ids(row, aliases) if mid not in available]
+        if key in blocked:
+            reason = "blocked by context cycle"
+        elif any(mid in contexts for mid in missing + tokens):
+            reason = "unresolved import dependencies"
+        elif ids and len(missing) == len(ids):
+            reason = "all members unavailable; context skipped"
+        else:
+            available.add(key)
+            reason = "partial context; unavailable references"
+        if missing or tokens:
+            print("  " + _context_row_diagnostic(number, key, reason, missing, tokens))
     for _, r in _zip_records(zf, "relationships"):
         if r["from_id"] not in available or r["to_id"] not in available:
             print(f"  Relationship {r['id']}: unavailable endpoint")
@@ -3067,6 +3273,10 @@ def run_zip_import(
                         raise ValueError("Checkpoint is unbound or belongs to another archive or destination. "
                                          "Preserve it and use a separate --checkpoint-dir for a new import.")
                     checkpoint.validate_source_keys(source_keys)
+                    for section, duplicate_ids in _zip_conflicting_destinations(zf, checkpoint).items():
+                        if duplicate_ids:
+                            raise ValueError(f"Checkpoint contains conflicting {section} destination receipts. "
+                                             "Preserve it and use tools/verify_restore.py for a per-record report.")
                     valid_exclusions = {r["id"] for _, r in _zip_records(zf, "memories")
                                         if r.get("memory_type") == "identity_core"}
                     if set(checkpoint.skipped_memories) - valid_exclusions:
@@ -3079,6 +3289,11 @@ def run_zip_import(
                         for _, row in _zip_records(zf, "relationships"):
                             if row.get("traversal_properties") and row["id"] in checkpoint.relationships_done:
                                 checkpoint.relationship_traversal.setdefault(row["id"], "unverified")
+                        for _, row in _zip_records(zf, "contexts"):
+                            key = row["id"]
+                            if (key in checkpoint.contexts and not checkpoint.contexts[key].startswith(SKIP_SENTINEL_PREFIX)
+                                    and _CONTEXT_MEMORY_TOKEN.search(row.get("description") or "")):
+                                checkpoint.context_description_checks.setdefault(key, "unverified")
                         print("Checking saved write-time receipts for this destination.")
                         settled = all(_index_state(r["processing_status"], r.get("embedding_progress")) == "ready"
                                       for r in checkpoint.document_processing.values())
@@ -3625,12 +3840,14 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
                 if checkpoint.phase != "done" or not checkpoint.commit_sha or not current_sha:
                     raise ValueError("Vault inputs changed since the checkpoint. Restore the saved inputs "
                                      "or use a separate checkpoint after reconciling the destination.")
-                added = set(_git_new_files_since(vault_path, checkpoint.commit_sha))
                 changed = {key for key, digest in checkpoint.source_hashes.items() if hashes.get(key) != digest}
-                new = hashes.keys() - checkpoint.source_hashes.keys()
-                if changed or not _are_committed_additions(vault_path, new, added):
+                if changed:
                     raise ValueError("Completed vault changed beyond committed additions. "
                                      "Reconcile the source and destination before another import.")
+                added = set(_git_new_files_since(vault_path, checkpoint.commit_sha, current_sha))
+                new = {key: hashes[key] for key in hashes.keys() - checkpoint.source_hashes.keys()}
+                _verify_committed_additions(vault_path, new, added, current_sha)
+                checkpoint.commit_sha = current_sha
             elif checkpoint.phase == "done":
                 if not receipts_complete(checkpoint):
                     raise ValueError("Completed checkpoint has missing or unexpected receipts; reconcile before resuming")
@@ -3638,6 +3855,8 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
                     logger.info("Vault already imported for this destination and snapshot.")
                     return 0
 
+        else:
+            checkpoint.commit_sha = current_sha
         checkpoint.scope = scope
         checkpoint.source_hashes = hashes
         checkpoint.phase = "memories"
@@ -3663,7 +3882,6 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
             logger.error("Vault import incomplete. See the report and retry after resolving failures.")
             return 1
         checkpoint.phase = "done"
-        checkpoint.commit_sha = current_sha
         checkpoint.save(checkpoint_path)
 
     # Summarization usage summary
