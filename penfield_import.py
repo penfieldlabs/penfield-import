@@ -308,6 +308,7 @@ class Checkpoint:
             "failed_relationships": self.failed_relationships,
             "documents": self.documents,
             "failed_documents": self.failed_documents,
+            "document_upload_errors_checked": True,
             "document_processing": self.document_processing,
             "document_embedding_progress": self.document_embedding_progress,
             "vault_artifacts": self.vault_artifacts,
@@ -337,6 +338,7 @@ class Checkpoint:
                 raise ValueError(f"Invalid vault checkpoint field {key}")
         if data.get("phase", "parse") not in PHASE_ORDER:
             raise ValueError("Unrecognized vault checkpoint phase")
+        _check_old_document_failures(data)
         return cls(
             scope=data.get("scope", {}),
             git_inventory_checked=data.get("git_baseline_version") == 3,
@@ -370,9 +372,9 @@ class Checkpoint:
             with _track_acknowledgement(self.pending_write, self, path):
                 yield
         except APIError as exc:
-            if exc.status_code in (0, 408) or exc.status_code >= 500:
+            if exc.keep_write_intent(self.pending_write, self, path, document_upload=kind == "document"):
                 raise ValueError(f"Uncertain {kind} write for {keys!r}. "
-                                 "Reconcile the destination before resuming.") from exc
+                                 f"{exc}. Reconcile the destination before resuming.") from exc
             self.pending_write = None
             raise
         else:
@@ -627,6 +629,15 @@ def _retry_delay(value: Optional[str], attempt: int) -> float:
     return 2 ** attempt
 
 
+def _check_old_document_failures(data: dict) -> None:
+    # Older releases discarded the HTTP status even if extraction created a failed document.
+    if data.get("document_upload_errors_checked") is not True:
+        unknown = sorted(set(data.get("failed_documents", [])) - data.get("documents", {}).keys())
+        if unknown:
+            raise ValueError(f"Older checkpoint has document failures without receipts: {unknown!r}. "
+                             "Reconcile these uploads on the destination before resuming.")
+
+
 class APIError(Exception):
     """Penfield API error."""
 
@@ -639,6 +650,16 @@ class APIError(Exception):
         self.request_id = request_id
         suffix = f" (request {request_id})" if request_id else ""
         super().__init__(f"HTTP {status_code} from {url}{suffix}")
+
+    def keep_write_intent(self, intent, checkpoint, path: Path, *, document_upload: bool) -> bool:
+        # The upload endpoint can persist a failed document before returning HTTP 400.
+        if document_upload and self.status_code == 400:
+            intent["http_status"] = self.status_code
+            if self.request_id:
+                intent["request_id"] = self.request_id
+            checkpoint.save(path)
+            return True
+        return self.status_code in (0, 408) or self.status_code >= 500
 
     @classmethod
     def from_http(cls, exc, url):
@@ -2281,6 +2302,7 @@ class ZipCheckpoint:
             **{k: v for k, v in vars(self).items() if k != "write_keys" and (k != "relationship_traversal" or v)},
             "relationships_done": sorted(self.relationships_done),
             "checkpoint_version": 1,
+            "document_upload_errors_checked": True,
         }
 
     @classmethod
@@ -2308,6 +2330,7 @@ class ZipCheckpoint:
             setattr(checkpoint, key, value)
         if checkpoint.phase not in ZIP_PHASE_ORDER:
             raise ValueError("Invalid ZIP checkpoint phase")
+        _check_old_document_failures(data)
         if any(not isinstance(item, dict) or not isinstance(item.get("processing_status"), str)
                for item in checkpoint.document_processing.values()):
             raise ValueError("Invalid document processing receipt")
@@ -3422,7 +3445,8 @@ class _JournaledZipClient:
                 with _track_acknowledgement(self.checkpoint.in_flight, self.checkpoint, self.path):
                     result = method(*args, **kwargs)
             except APIError as exc:
-                if exc.status_code == 0 or exc.status_code == 408 or exc.status_code >= 500:
+                if exc.keep_write_intent(self.checkpoint.in_flight, self.checkpoint, self.path,
+                                         document_upload=name == "upload_document_bytes"):
                     raise ValueError(f"Uncertain outcome for {self.checkpoint.in_flight}; "
                                      "reconcile this write before resuming") from exc
                 self.checkpoint.in_flight = {}

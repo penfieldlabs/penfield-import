@@ -1,5 +1,6 @@
 """Original document restoration and asynchronous vector indexing have separate receipts."""
 import json
+import sys
 import zipfile
 from unittest.mock import Mock
 
@@ -93,3 +94,48 @@ def test_vault_refreshes_failed_chunks_despite_completed_processing(tmp_path, mo
 ])
 def test_index_state(status, progress, expected):
     assert imp._index_state(status, progress) == expected
+
+
+@pytest.mark.parametrize("vault", [True, False], ids=["vault", "zip"])
+def test_document_upload_error_cannot_duplicate_failed_server_record(tmp_path, monkeypatch, vault):
+    api = Mock(spec=imp.PenfieldClient)
+    api.destination_identity.return_value = "verified-target"
+    api.upload_document_bytes.side_effect = imp.APIError(400, "Extraction failed", "/documents/upload",
+                                                        request_id="req-document-test")
+    if vault:
+        docs = tmp_path / "Documents"
+        docs.mkdir()
+        (docs / "original.txt").write_bytes(b"original bytes")
+        source = tmp_path
+        state = tmp_path / imp.CHECKPOINT_FILENAME
+    else:
+        source = document_archive(tmp_path / "test.zip")
+        state = tmp_path / imp.ZIP_CHECKPOINT_FILENAME
+    monkeypatch.setattr(sys, "argv", ["penfield-import", str(source), "--checkpoint-dir", str(tmp_path)])
+    monkeypatch.setattr(imp, "_resolve_auth", lambda args: imp._AuthInfo(api_key="fixture"))
+    monkeypatch.setattr(imp, "PenfieldClient", lambda **kwargs: api)
+    assert imp.main() == 1
+    saved = state.read_bytes()
+    intent = json.loads(saved)["pending_write" if vault else "in_flight"]
+    assert intent["http_status"] == 400
+    assert intent["request_id"] == "req-document-test"
+    assert intent["keys" if vault else "source_keys"] == (["original.txt"] if vault else ["doc"])
+    assert imp.main() == 1
+    assert state.read_bytes() == saved
+    api.upload_document_bytes.assert_called_once()
+
+
+@pytest.mark.parametrize("kind", [imp.Checkpoint, imp.ZipCheckpoint])
+def test_old_document_failure_without_receipt_requires_reconciliation(kind):
+    old = kind(failed_documents=["failed.pdf"]).to_dict()
+    del old["document_upload_errors_checked"]
+    with pytest.raises(ValueError, match=r"failed\.pdf"):
+        kind.from_dict(old)
+    old["documents"]["failed.pdf"] = "existing-id"
+    assert kind.from_dict(old).documents["failed.pdf"] == "existing-id"
+
+
+@pytest.mark.parametrize("kind", [imp.Checkpoint, imp.ZipCheckpoint])
+def test_current_definite_document_failures_remain_retryable(kind):
+    state = kind(failed_documents=["rejected.pdf"])
+    assert kind.from_dict(state.to_dict()).failed_documents == ["rejected.pdf"]
