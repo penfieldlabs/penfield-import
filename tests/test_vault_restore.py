@@ -543,7 +543,11 @@ def test_upgrade_recovers_file_omitted_from_completed_git_checkpoint(monkeypatch
     old = importer.Checkpoint.load(cp)
     old.git_inventory_checked = False
     old.commit_sha = _git_at(vault, "rev-parse", "HEAD")
-    old.save(cp)
+    import json
+    legacy = old.to_dict()
+    legacy.pop("git_baseline_version")
+    legacy["git_inventory_checked"] = True  # R3 set this even when the first import omitted a tracked file.
+    cp.write_text(json.dumps(legacy))
     missed.unlink()
     assert run(monkeypatch, vault) == 1
     _git_at(vault, "restore", "missed.md")
@@ -551,3 +555,43 @@ def test_upgrade_recovers_file_omitted_from_completed_git_checkpoint(monkeypatch
     assert run(monkeypatch, vault) == 0
     assert destination.create_memory.call_count == 2
     assert importer.Checkpoint.load(cp).memories.keys() == {"base.md", "missed.md"}
+
+
+@pytest.mark.parametrize("missing", ["note.md", "Artifacts/log.txt", "Documents/terms.csv"])
+@pytest.mark.parametrize("sibling", [True, False])
+def test_first_git_snapshot_requires_every_committed_input(monkeypatch, vault, destination, missing, sibling):
+    destination.upload_document_bytes.return_value = {"id": "D", "processing_status": "completed"}
+    _git_at(vault, "init")
+    file = vault / missing
+    file.parent.mkdir(exist_ok=True)
+    file.write_text("committed")
+    if sibling:
+        (vault / "visible.md").write_text("visible")
+    _git_at(vault, "add", ".")
+    _git_at(vault, "commit", "-qm", "baseline")
+    file.unlink()
+    for opts in [("--dry-run",), (), ()]:
+        assert run(monkeypatch, vault, *opts) == 1
+    assert not (vault / importer.CHECKPOINT_FILENAME).exists()
+    destination.create_memory.assert_not_called()
+    destination.create_artifact.assert_not_called()
+    destination.upload_document_bytes.assert_not_called()
+    _git_at(vault, "restore", "--", missing)
+    assert run(monkeypatch, vault) == 0
+    assert run(monkeypatch, vault) == 0
+    calls = (destination.create_memory.call_count + destination.create_artifact.call_count
+             + destination.upload_document_bytes.call_count)
+    assert calls == 1 + sibling
+
+
+def test_vault_duplicate_note_id_keeps_pending_write(monkeypatch, vault, destination):
+    for name in ("a.md", "b.md"):
+        (vault / name).write_text("same")
+    destination.create_memory.side_effect = ["shared", "shared"]
+    assert run(monkeypatch, vault) == 1
+    assert run(monkeypatch, vault) == 1
+    cp = importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME)
+    assert cp.memories == {"a.md": "shared"} and cp.pending_write["keys"] == ["b.md"]
+    assert destination.create_memory.call_count == 2
+    with pytest.raises(ValueError, match="repeated memory destination"):
+        importer.Checkpoint.from_dict({"memories": {"a.md": "shared", "b.md": "shared"}})

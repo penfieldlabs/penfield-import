@@ -8,6 +8,8 @@ Incremental Git imports check new notes, artifacts and documents against the sel
 
 R2 (`d4d14e1`) could advance past a missing committed file, record a skipped vault artifact as uploaded and trust an incorrect older edge receipt. This revision checks the complete eligible Git additions, hashes the artifact bytes used for upload and compares legacy edge receipts with a fresh destination read. A completed edge without an ID requires reconciliation. Markdown code examples no longer create graph edges. UUIDs in graph references resolve regardless of letter case.
 
+R3 (`fc0924c`) could omit a committed file on a first Git import. Older ZIP receipts could also hide a Boolean/number change in stored metadata. This revision checks the first Git snapshot before writes and rechecks metadata on upgrade for memories, contexts and documents. Two distinct vault notes must receive distinct IDs. An unavailable artifact media type is a partial result even when its bytes match.
+
 ## Restoring with the candidate
 
 1. Create a virtual environment and install the package as described in the README.

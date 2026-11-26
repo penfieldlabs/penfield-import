@@ -2466,7 +2466,7 @@ class TestZipArtifactsPhase:
         artifact_files = {"artifacts/readme.md": b"hello"}
         data = _make_export_zip(artifacts_meta=artifacts_meta, artifact_files=artifact_files)
         client = mock.MagicMock(spec=vtp.PenfieldClient)
-        client.create_artifact.return_value = {}
+        client.create_artifact.return_value = {"data": {"content_type": "text/markdown"}}
         cp = vtp.ZipCheckpoint()
         cp_path = tmp_path / "cp.json"
 
@@ -2704,7 +2704,7 @@ class TestZipImportEndToEnd:
         client.destination_identity.return_value = "test-destination"
         client.create_memory.side_effect = mock_create_memory
         client.create_relationships_bulk.return_value = {"verified_ids": ["edge-1"]}
-        client.create_artifact.return_value = {}
+        client.create_artifact.return_value = {"data": {"content_type": "text/markdown"}}
         client.get_memory_count.return_value = 2
 
         result = vtp.run_zip_import(zip_path, client, checkpoint_dir=tmp_path)

@@ -296,7 +296,7 @@ class Checkpoint:
         d = {
             "phase": self.phase,
             "scope": self.scope,
-            "git_inventory_checked": self.git_inventory_checked,
+            "git_baseline_version": 2 if self.git_inventory_checked else 0,
             "source_hashes": self.source_hashes,
             "unresolved_links": self.unresolved_links,
             "pending_write": self.pending_write,
@@ -324,11 +324,12 @@ class Checkpoint:
             raise ValueError("Vault checkpoint must contain a JSON object")
         for key in ("memories", "artifacts", "documents", "vault_artifacts", "source_hashes", "document_processing"):
             mapping = data.get(key, {})
-            if not isinstance(mapping, dict) or not all(isinstance(v, str) and v for v in mapping.values()):
+            if not isinstance(mapping, dict) or not all(isinstance(v, str) and v.strip() for v in mapping.values()):
                 raise ValueError(f"Invalid vault checkpoint field {key}")
-        document_ids = [v for v in data.get("documents", {}).values() if not v.startswith(SKIP_SENTINEL_PREFIX)]
-        if len(set(document_ids)) != len(document_ids):
-            raise ValueError("Vault checkpoint contains repeated document destination IDs")
+        for ledger, kind in (("memories", "memory"), ("documents", "document")):
+            ids = [value for value in data.get(ledger, {}).values() if not value.startswith(SKIP_SENTINEL_PREFIX)]
+            if len(set(ids)) != len(ids):
+                raise ValueError(f"Vault checkpoint contains repeated {kind} destination IDs")
         for key in ("relationships_done", "failed_memories", "failed_artifacts", "failed_documents",
                     "failed_vault_artifacts", "failed_relationships", "unresolved_links"):
             values = data.get(key, [])
@@ -338,7 +339,7 @@ class Checkpoint:
             raise ValueError("Unrecognized vault checkpoint phase")
         return cls(
             scope=data.get("scope", {}),
-            git_inventory_checked=data.get("git_inventory_checked") is True,
+            git_inventory_checked=data.get("git_baseline_version") == 2,
             source_hashes=data.get("source_hashes", {}),
             unresolved_links=data.get("unresolved_links", []),
             pending_write=data.get("pending_write"),
@@ -461,6 +462,15 @@ def _vault_path_eligible(path: Path, skip_dirs: set[str]) -> bool:
     document = (path.parts[0] == "Documents" and path.suffix.lower() in DOCUMENT_EXTENSIONS
                 and path.as_posix() != "Documents/documents.json")
     return note or document or (len(path.parts) > 1 and path.parts[0] == "Artifacts")
+
+
+def _verify_git_inventory(vault_path, commit, paths, inventory, skip_dirs, required=()):
+    eligible = {p for p in paths if _vault_path_eligible(Path(p), skip_dirs)}
+    normalized = {unicodedata.normalize("NFC", path) for path in eligible}
+    required = set(required)
+    selected = {key: digest for key, digest in inventory.items()
+                if key in required or unicodedata.normalize("NFC", key) in normalized}
+    _verify_committed_additions(vault_path, selected, eligible, commit)
 
 
 def _git_text_checkout_is_crlf(vault_path: Path, path: str) -> bool:
@@ -1607,8 +1617,10 @@ def run_memories_phase(
         try:
             with checkpoint.writing(checkpoint_path, "memory", [note.rel_path]):
                 memory_id = client.create_memory(content=content, tags=note.tags, memory_type=note.memory_type)
-                if not isinstance(memory_id, str) or not memory_id:
-                    raise ValueError(f"Memory write returned no ID for {note.rel_path}; reconcile the destination")
+                if (not isinstance(memory_id, str) or not memory_id.strip()
+                        or memory_id.startswith(SKIP_SENTINEL_PREFIX) or memory_id in checkpoint.memories.values()):
+                    raise ValueError(f"Missing or repeated memory destination ID for {note.rel_path}; "
+                                     "reconcile the pending write before resuming")
             checkpoint.memories[note.rel_path] = memory_id
             if note.rel_path in checkpoint.failed_memories:
                 checkpoint.failed_memories.remove(note.rel_path)
@@ -2202,6 +2214,9 @@ class ZipCheckpoint:
     document_processing: dict[str, dict[str, Any]] = field(default_factory=dict)
     document_tag_omissions: dict[str, list[str]] = field(default_factory=dict)
     artifact_mime_mismatches: dict[str, str] = field(default_factory=dict)
+    artifact_type_receipts: dict[str, str] = field(default_factory=dict)
+    typed_metadata_v1: dict[str, str] = field(default_factory=dict)
+    metadata_issues: dict[str, str] = field(default_factory=dict)
     relationship_id_map: dict[str, str] = field(default_factory=dict)
     relationship_receipt_checks: dict[str, str] = field(default_factory=dict)
     relationship_traversal: dict[str, str] = field(default_factory=dict)
@@ -2278,7 +2293,16 @@ class ZipCheckpoint:
             seen.update(getattr(self, "failed_" + section))
             if not seen <= keys[section]:
                 raise ValueError(f"Checkpoint contains unknown {section} keys")
-        if not (self.document_processing.keys() <= self.documents.keys()
+        metadata_destinations = {section + "/" + key: dest
+                                 for section, mapping in (("memories", self.memory_id_map), ("contexts", self.contexts),
+                                                          ("documents", self.documents))
+                                 for key, dest in mapping.items() if not dest.startswith(SKIP_SENTINEL_PREFIX)}
+        if (any(metadata_destinations.get(key) != dest for key, dest in self.typed_metadata_v1.items())
+                or not self.metadata_issues.keys() <= metadata_destinations.keys()
+                or self.metadata_issues.keys() & self.typed_metadata_v1.keys()):
+            raise ValueError("Inconsistent metadata verification receipts")
+        if not (self.artifact_type_receipts.keys() <= self.artifacts.keys()
+                and self.document_processing.keys() <= self.documents.keys()
                 and self.document_tag_omissions.keys() <= keys["documents"]
                 and self.artifact_mime_mismatches.keys() <= self.artifacts.keys()
                 and set(self.identical_artifacts) <= self.artifacts.keys()
@@ -2539,6 +2563,8 @@ def run_zip_memories_phase(
                 source_type=rec.get("source_type"),
                 metadata=rec.get("metadata"),
             )
+            if rec.get("metadata"):
+                checkpoint.typed_metadata_v1["memories/" + source_id] = new_id
             checkpoint.memory_id_map[source_id] = new_id
             if source_id in checkpoint.failed_memories:
                 checkpoint.failed_memories.remove(source_id)
@@ -2937,6 +2963,8 @@ def run_zip_contexts_phase(
                 checkpoint.contexts[key] = "__skipped_conflict__"
             record_issues(key, unresolved, missing_tokens)
             return
+        if rec.get("checkpoint_metadata"):
+            checkpoint.typed_metadata_v1["contexts/" + key] = new_id
         checkpoint.contexts[key] = mapped[key] = new_id
         if description_ids:
             checkpoint.context_description_checks[key] = "matched"
@@ -2959,6 +2987,68 @@ def run_zip_contexts_phase(
 
 
 _ARTIFACT_PATH_RE = re.compile(r'^/[a-zA-Z0-9\-_./]+$')
+
+
+def _check_artifact_type(checkpoint, row, stored):
+    key = row["path"]
+    expected = row.get("content_type")
+    if not expected:
+        return
+    actual = stored.get("content_type") if isinstance(stored, dict) else None
+    if isinstance(actual, str) and expected.lower() == actual.lower():
+        checkpoint.artifact_type_receipts[key] = expected
+        checkpoint.artifact_mime_mismatches.pop(key, None)
+    else:
+        checkpoint.artifact_type_receipts.pop(key, None)
+        checkpoint.artifact_mime_mismatches[key] = f"{expected} -> {actual or 'unavailable'}"
+        logger.warning("Artifact %s content_type: %s", key, checkpoint.artifact_mime_mismatches[key])
+
+
+def _recheck_saved_fields(archive, client, checkpoint):
+    """Qualify prior field receipts by source row and destination. Never replay a create."""
+    checked = False
+    for section, ledger, field, route in (
+        ("memories", checkpoint.memory_id_map, "metadata", "/memories/"),
+        ("contexts", checkpoint.contexts, "checkpoint_metadata", "/memories/"),
+        ("documents", checkpoint.documents, "metadata", "/documents/"),
+    ):
+        for _, row in _zip_records(archive, section):
+            key = section + "/" + row["id"]
+            dest = ledger.get(row["id"])
+            expected = row.get(field)
+            if (not expected or not dest or dest.startswith(SKIP_SENTINEL_PREFIX)
+                    or checkpoint.typed_metadata_v1.get(key) == dest):
+                continue
+            checked = True
+            try:
+                stored = client._readback(route + urllib.parse.quote(dest, safe=""))
+                if stored.get("id") == dest and _source_object_matches(expected, stored.get("metadata")):
+                    checkpoint.typed_metadata_v1[key] = dest
+                    checkpoint.metadata_issues.pop(key, None)
+                    continue
+                reason = "destination ID or metadata mismatch"
+            except APIError:
+                reason = "destination read unavailable"
+            checkpoint.metadata_issues[key] = reason
+            logger.warning("%s (%s): %s", key, dest, reason)
+
+    for _, row in _zip_records(archive, "artifacts"):
+        key = row["path"]
+        if (not row.get("content_type") or checkpoint.artifacts.get(key) != key
+                or (checkpoint.artifact_type_receipts.get(key) == row["content_type"]
+                    and key not in checkpoint.artifact_mime_mismatches)):
+            continue
+        checked = True
+        path = "/artifacts?" + urllib.parse.urlencode({"path": key})
+        try:
+            stored = client._readback(path)
+        except APIError:
+            stored = {}
+        if stored.get("path") != key or stored.get("content") != archive.read("artifacts" + key).decode("utf-8"):
+            checkpoint.artifact_mime_mismatches[key] = "destination path or content could not be verified"
+        else:
+            _check_artifact_type(checkpoint, row, stored)
+    return checked
 
 
 def run_zip_artifacts_phase(
@@ -3031,12 +3121,7 @@ def run_zip_artifacts_phase(
             if art_path in checkpoint.failed_artifacts:
                 checkpoint.failed_artifacts.remove(art_path)
             stored = receipt.get("data") if isinstance(receipt, dict) else None
-            actual_type = stored.get("content_type") if isinstance(stored, dict) else None
-            expected_type = rec.get("content_type")
-            if (isinstance(expected_type, str) and isinstance(actual_type, str)
-                    and expected_type.lower() != actual_type.lower()):
-                checkpoint.artifact_mime_mismatches[art_path] = f"{expected_type} -> {actual_type}"
-                logger.warning("Artifact content type differs from the export for %s", art_path)
+            _check_artifact_type(checkpoint, rec, stored)
         except APIError as e:
             if e.status_code == 0 or e.status_code >= 500:
                 raise
@@ -3125,6 +3210,8 @@ def run_zip_documents_phase(
             new_id = result.get("id") or result.get("document_id")
             if not isinstance(new_id, str) or not new_id.strip():
                 raise APIError(0, "Document upload returned no destination ID", "/documents/upload")
+            if doc_metadata:
+                checkpoint.typed_metadata_v1["documents/" + source_id] = new_id
             checkpoint.documents[source_id] = new_id
             _record_zip_document_status(checkpoint, source_id, result)
         except APIError as e:
@@ -3182,6 +3269,8 @@ def run_zip_verify_phase(
         elif section == "documents":
             partial_keys = {key for key in checkpoint.document_tag_omissions if key in checkpoint.documents
                             and not checkpoint.documents[key].startswith(SKIP_SENTINEL_PREFIX)}
+        partial_keys.update(key.split("/", 1)[1] for key in checkpoint.metadata_issues
+                            if key.startswith(section + "/"))
         identical = len(set(getattr(checkpoint, "identical_" + section, ())) - partial_keys)
         partial = len(partial_keys)
         print(f"{section.upper()}: {accepted - identical - partial} restored, {identical} identical, "
@@ -3385,6 +3474,7 @@ def run_zip_import(
                     if checkpoint.in_flight:
                         raise ValueError(f"Unconfirmed write {checkpoint.in_flight}; reconcile with the destination "
                                          "before resuming. Retain this checkpoint.")
+                    checked_fields = _recheck_saved_fields(zf, client, checkpoint)
                     if checkpoint.phase == "done":
                         # Older checkpoints did not record whether traversal properties were sent or checked.
                         for _, row in _zip_records(zf, "relationships"):
@@ -3399,6 +3489,9 @@ def run_zip_import(
                         settled = all(_index_state(r["processing_status"], r.get("embedding_progress")) == "ready"
                                       for r in checkpoint.document_processing.values())
                         if settled and run_zip_verify_phase(client, checkpoint, manifest):
+                            if checked_fields:
+                                checkpoint.phase = "done"
+                                checkpoint.save(checkpoint_path)
                             return 0
                 checkpoint.source_sha256 = source
                 checkpoint.destination = destination
@@ -3849,13 +3942,19 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
     preview = Checkpoint(memories={n.rel_path: str(i) for i, n in enumerate(notes)
                                    if format_memory_content(n, args.include_frontmatter).strip()})
     build_relationship_list(notes, preview)
+    checkpoint_dir = (args.checkpoint_dir or vault_path).resolve()
+    checkpoint_path = checkpoint_dir / CHECKPOINT_FILENAME
+    inventory = {**excluded_hashes, **hashes}
+    fresh = args.reset or not checkpoint_path.exists()
+    baseline_sha = _git_head_sha(vault_path) if fresh else None
+    if baseline_sha:
+        _verify_git_inventory(vault_path, baseline_sha, _git_unrecorded_inputs(vault_path, baseline_sha, {}),
+                              inventory, set(args.skip_dirs))
     if args.dry_run:
         dry_run_report(notes, args, artifact_count=len(artifacts), document_count=len(documents))
         return int(bool(preview.unresolved_links))
     if preview.unresolved_links:
         raise ValueError(f"{len(preview.unresolved_links)} unresolved vault links; see warnings above")
-    checkpoint_dir = (args.checkpoint_dir or vault_path).resolve()
-    checkpoint_path = checkpoint_dir / CHECKPOINT_FILENAME
     if not hashes and not checkpoint_path.exists():
         logger.info("Empty vault; there are no supported notes, artifacts or documents to import.")
         return 0
@@ -3913,6 +4012,7 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
                       ["llm", args.llm_base_url, args.llm_model] if args.llm else None,
     }
     expected_note_paths = {note.rel_path for note in notes}
+    empty_notes = expected_note_paths - preview.memories.keys()
     expected_artifacts = {n.rel_path for n in notes if _is_oversized(n, args.include_frontmatter)}
     expected_vault_artifacts = {p.relative_to(vault_path / "Artifacts").as_posix() for p in artifacts}
     expected_documents = {p.relative_to(vault_path / "Documents").as_posix() for p in documents}
@@ -3920,6 +4020,8 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
 
     def receipts_complete(state: Checkpoint) -> bool:
         return (state.memories.keys() == expected_note_paths
+                and all((value == SKIP_EMPTY if key in empty_notes else not value.startswith(SKIP_SENTINEL_PREFIX))
+                        for key, value in state.memories.items())
                 and state.artifacts.keys() == expected_artifacts
                 and state.vault_artifacts == {key: "/" + key for key in expected_vault_artifacts}
                 and state.documents.keys() == expected_documents
@@ -3950,13 +4052,8 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
                 if legacy_git:
                     # An old successful increment could omit a committed file and advance its SHA.
                     added.update(_git_unrecorded_inputs(vault_path, checkpoint.commit_sha, checkpoint.source_hashes))
-                eligible = {path for path in added if _vault_path_eligible(Path(path), set(args.skip_dirs))}
-                new = {key: hashes[key] for key in hashes.keys() - checkpoint.source_hashes.keys()}
-                inventory = {**excluded_hashes, **hashes}
-                folded = {unicodedata.normalize("NFC", key) for key in eligible}
-                new.update((key, digest) for key, digest in inventory.items()
-                           if unicodedata.normalize("NFC", key) in folded)
-                _verify_committed_additions(vault_path, new, eligible, current_sha)
+                _verify_git_inventory(vault_path, current_sha, added, inventory, set(args.skip_dirs),
+                                      hashes.keys() - checkpoint.source_hashes.keys())
                 if changed_inventory:
                     checkpoint.commit_sha = current_sha
             # R2 could mark a preflighted artifact skipped after its local bytes changed.
@@ -3975,8 +4072,12 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
                     return 0
 
         else:
+            if not fresh or current_sha != baseline_sha:
+                raise ValueError("Git baseline or checkpoint changed during preflight; retry the import")
             checkpoint.commit_sha = current_sha
-        checkpoint.git_inventory_checked = True
+            checkpoint.git_inventory_checked = True
+        if checkpoint.phase == "done":
+            checkpoint.git_inventory_checked = True
         checkpoint.scope = scope
         checkpoint.source_hashes = hashes
         checkpoint.phase = "memories"

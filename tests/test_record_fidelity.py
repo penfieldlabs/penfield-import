@@ -1,6 +1,8 @@
 """ZIP write receipts and independent readback must agree about object identity and JSON types."""
 import copy
 import io
+from email.parser import BytesParser
+from email.policy import default
 import json
 from urllib.parse import urlsplit
 import zipfile
@@ -15,10 +17,11 @@ PROPERTIES = {"nested": {"items": [True, 0.0]}}
 TARGET = '["https://example.invalid","fixture","user"]'
 
 
-def archive_with(tmp_path, documents=None, relationships=None, memory_metadata=None):
+def archive_with(tmp_path, documents=None, relationships=None, memory_metadata=None, contexts=None):
     path = tmp_path / "source.zip"
     sections = {s: [] for s in imp.ZIP_SECTIONS}
     sections["memories"] = [{"id": "a", "content": "A", "metadata": memory_metadata}, {"id": "b", "content": "B"}]
+    sections["contexts"] = contexts or []
     sections["documents"] = documents or []
     sections["relationships"] = relationships or []
     with zipfile.ZipFile(path, "w") as archive:
@@ -66,7 +69,7 @@ class Service:
         assert method == "POST"
         self.posted.append((path, data))
         if path == "/memories":
-            record = dict(data, id=data["content"])
+            record = dict(data, id="C" if data.get("memory_type") == "checkpoint" else data["content"])
             self.objects["/memories/" + record["id"]] = record
             return {"data": {"id": record["id"]}}
         assert path == "/relationships/bulk" and len(data) == 1
@@ -86,8 +89,11 @@ class Service:
         self.posted.append((path, None))
         stored = dict(id="D", filename="same.txt", content_type="text/plain", processing_status="completed",
                       embedding_progress={"completed": 1, "total": 1, "pending": 0, "failed": 0})
-        if b'name="metadata"' in request.data:
-            stored["metadata"] = copy.deepcopy(PROPERTIES)
+        message = BytesParser(policy=default).parsebytes(
+            b"Content-Type: " + request.get_header("Content-type").encode() + b"\r\n\r\n" + request.data)
+        for part in message.iter_parts():
+            if part.get_param("name", header="content-disposition") == "metadata":
+                stored["metadata"] = json.loads(part.get_payload(decode=True))
         self.objects["/documents/D"] = stored
         return io.BytesIO(b'{"data":{"id":"D"}}')
 
@@ -249,3 +255,68 @@ def test_legacy_relationship_receipt_requires_destination_readback(tmp_path, mon
     assert len(service.posted) == writes
     if legacy == "correct":
         assert imp.ZipCheckpoint.load(path).relationship_receipt_checks["e"] == "typed-v1"
+
+
+@pytest.mark.parametrize("section", ["memories", "documents", "contexts"])
+def test_migrate_typed_metadata_by_destination_id(tmp_path, monkeypatch, section):
+    service = Service(monkeypatch)
+    source = {"typed": {"items": [1]}}
+    args = {"memories": {"memory_metadata": source},
+            "documents": {"documents": [document(metadata=source)]},
+            "contexts": {"contexts": [{"id": "c", "name": "context", "memory_ids": ["a"],
+                                      "checkpoint_metadata": source}]}}[section]
+    archive = archive_with(tmp_path, **args)
+    assert imp.run_zip_import(archive, service.api) == 0
+    path = tmp_path / imp.ZIP_CHECKPOINT_FILENAME
+    data = json.loads(path.read_text())
+    data.pop("typed_metadata_v1")
+    path.write_text(json.dumps(data))
+    stored = service.objects[{"memories": "/memories/A", "documents": "/documents/D", "contexts": "/memories/C"}[section]]
+    stored["metadata"] = {"typed": {"items": [True]}}
+    writes = len(service.posted)
+    for attempt in range(2):
+        assert imp.run_zip_import(archive, service.api) == 2
+        code, rows = verify(archive, f"bad-{attempt}.jsonl")
+        assert code == 2 and any(row["section"] == section and "metadata" in row["mismatched_fields"] for row in rows)
+    stored["metadata"] = source
+    assert imp.run_zip_import(archive, service.api) == 0
+    assert imp.run_zip_import(archive, service.api) == 0
+    assert verify(archive)[0] == 0
+    assert len(service.posted) == writes
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_absent_artifact_mime_type_requires_readback_without_reupload(tmp_path, monkeypatch, legacy):
+    api = imp.PenfieldClient("https://example.invalid", access_token="fixture")
+    api.destination_identity = lambda: TARGET
+    stored = {"path": "/example.md", "content": "body"}
+    writes = []
+    def request(method, path, data=None):
+        if method == "POST":
+            writes.append(data)
+        return {"data": stored.copy()}
+    api.request = request
+    monkeypatch.setattr(verify_restore, "_client", lambda _: api)
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        counts = {s: int(s == "artifacts") for s in imp.ZIP_SECTIONS}
+        z.writestr("manifest.json", json.dumps(dict(schema_version="1.0", source_tenant_id="fixture", counts=counts)))
+        for section in counts:
+            z.writestr(section + ".jsonl", json.dumps({"path": "/example.md", "content_type": "text/markdown"})
+                       if section == "artifacts" else "")
+        z.writestr("artifacts/example.md", "body")
+    assert imp.run_zip_import(archive, api) == 2
+    cp_path = tmp_path / imp.ZIP_CHECKPOINT_FILENAME
+    if legacy:
+        cp = json.loads(cp_path.read_text())
+        cp.pop("artifact_type_receipts")
+        cp["artifact_mime_mismatches"] = {}
+        cp["phase"] = "done"
+        cp_path.write_text(json.dumps(cp))
+    assert imp.run_zip_import(archive, api) == 2
+    code, rows = verify(archive, "missing.jsonl")
+    assert code == 2 and rows[0]["mismatched_fields"] == ["content_type"]
+    assert "unavailable" in imp.ZipCheckpoint.load(cp_path).artifact_mime_mismatches["/example.md"]
+    stored["content_type"] = "text/markdown"
+    assert imp.run_zip_import(archive, api) == 0
+    assert verify(archive)[0] == 0 and len(writes) == 1

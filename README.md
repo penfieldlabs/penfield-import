@@ -34,7 +34,7 @@ Preview reads the archive locally. It checks the manifest and JSONL rows, record
 4. **Artifacts.** UTF-8 text up to 1 MiB is eligible. Occupied paths require matching destination content. Different bytes at the same path are a conflict. Binary artifacts require a separate preservation decision.
 5. **Documents.** Eligible originals up to 20 MiB are sent with their metadata. The importer checks the returned ID and downloads the original bytes for comparison. Indexing is asynchronous. The report distinguishes verified original bytes from pending, ready, unknown or failed chunk indexing. A rerun refreshes unresolved indexing by document ID. Failed chunks result in an incomplete restore even when the top-level status says completed.
 
-Successful writes receive a destination readback. Each completed ZIP relationship needs a destination ID. On upgrade, the importer reads older relationship receipts and compares the stored edge to the source, including JSON types in metadata and evidence. A mismatch stays incomplete on retry. A subsequent no-op uses the checkpoint's verified receipts. It does not scan for objects that somebody later edited or deleted.
+Successful writes receive a destination readback. Each completed ZIP relationship needs a destination ID. On upgrade, the importer reads older relationship receipts and compares the stored edge to the source, including JSON types in metadata and evidence. A mismatch stays incomplete on retry. Upgrades also read back source-declared metadata for memories, contexts and documents whose prior receipts lack a typed comparison. A Boolean and a number are distinct even when nested inside arrays. A missing or different source-declared artifact media type leaves the artifact partial, and a retry reads the existing path without uploading it again. A subsequent no-op uses the checkpoint's verified receipts. It does not scan for objects that somebody later edited or deleted.
 
 ### Verify a restored ZIP against the destination
 
@@ -356,7 +356,7 @@ python penfield_import.py /path/to/vault
 python penfield_import.py /path/to/vault
 ```
 
-- Missing eligible committed files stop the entire increment before any destination write. Restore them from the commit and retry with the same checkpoint. Vault artifacts are hashed again immediately before upload.
+- On the first import and on increments, the importer checks all eligible committed inputs in scope. A missing committed file or a working copy that differs from the pinned Git blob stops the run before any destination write. The first import can also include eligible untracked working files. Restore them from the commit and retry with the same checkpoint. Vault artifacts are hashed again immediately before upload.
 - Incremental imports compare each new note, artifact and document with its Git blob at the recorded commit. Text files may use CRLF working-copy line endings for an LF blob. Other differences stop the run before any writes. Commit the edit or restore the committed content before retrying. Changes to previously imported inputs require reconciliation with the destination.
 - The checkpoint stores the full `{rel_path: memory_id}` map from all prior runs, so relationships from new notes to existing notes resolve correctly.
 - For non-Git vaults, repeating a completed import checks the source snapshot and destination identity. A changed snapshot requires a separate restore decision.
