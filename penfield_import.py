@@ -286,6 +286,7 @@ class Checkpoint:
     failed_vault_artifacts: list[str] = field(default_factory=list)  # rel_paths
     commit_sha: Optional[str] = None                             # git HEAD at last completed import
     git_inventory_checked: bool = False
+    git_exclusions: dict[str, str] = field(default_factory=dict)
     scope: dict[str, Any] = field(default_factory=dict)
     source_hashes: dict[str, str] = field(default_factory=dict)
     unresolved_links: list[str] = field(default_factory=list)
@@ -297,6 +298,7 @@ class Checkpoint:
             "phase": self.phase,
             "scope": self.scope,
             "git_baseline_version": 3 if self.git_inventory_checked else 0,
+            "git_exclusions": self.git_exclusions,
             "source_hashes": self.source_hashes,
             "unresolved_links": self.unresolved_links,
             "pending_write": self.pending_write,
@@ -323,7 +325,7 @@ class Checkpoint:
         """Deserialize, ignoring unknown fields for forward compatibility."""
         if not isinstance(data, dict):
             raise ValueError("Vault checkpoint must contain a JSON object")
-        for key in ("memories", "artifacts", "documents", "vault_artifacts", "source_hashes", "document_processing"):
+        for key in ("memories", "artifacts", "documents", "vault_artifacts", "source_hashes", "document_processing", "git_exclusions"):
             mapping = data.get(key, {})
             if not isinstance(mapping, dict) or not all(isinstance(v, str) and v.strip() for v in mapping.values()):
                 raise ValueError(f"Invalid vault checkpoint field {key}")
@@ -342,6 +344,7 @@ class Checkpoint:
         return cls(
             scope=data.get("scope", {}),
             git_inventory_checked=data.get("git_baseline_version") == 3,
+            git_exclusions=data.get("git_exclusions", {}),
             source_hashes=data.get("source_hashes", {}),
             unresolved_links=data.get("unresolved_links", []),
             pending_write=data.get("pending_write"),
@@ -414,7 +417,7 @@ def _git_head_sha(vault_path: Path) -> Optional[str]:
     or ``None`` if the path is not inside a git repository."""
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
             capture_output=True, text=True, timeout=10,
             cwd=str(vault_path),
         )
@@ -422,6 +425,8 @@ def _git_head_sha(vault_path: Path) -> Optional[str]:
             return result.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
+    if any(os.path.lexists(folder / ".git") for folder in (vault_path, *vault_path.parents)):
+        raise ValueError("Cannot verify Git HEAD for this vault; check Git availability and its committed snapshot")
     return None
 
 
@@ -451,21 +456,6 @@ def _git_new_files_since(vault_path: Path, since_sha: str, end_sha: str = "HEAD"
     return added
 
 
-def _git_regular_files(vault_path: Path, commit: str) -> set[str]:
-    """List regular files from the pinned tree independently of the working copy."""
-    tree = subprocess.run(["git", "ls-tree", "-rz", commit, "--", "."], cwd=vault_path,
-                          capture_output=True, timeout=30)
-    if tree.returncode:
-        raise ValueError("Cannot inspect the saved Git tree for missing inputs")
-    paths = set()
-    for item in tree.stdout.split(b"\0"):
-        if item:
-            meta, name = item.split(b"\t", 1)
-            if meta.split()[0] in (b"100644", b"100755"):
-                paths.add(os.fsdecode(name))
-    return paths
-
-
 def _vault_path_eligible(path: Path, skip_dirs: set[str]) -> bool:
     if path.name.startswith((".penfield_import", ".penfield_zip_import")):
         return False
@@ -475,52 +465,76 @@ def _vault_path_eligible(path: Path, skip_dirs: set[str]) -> bool:
     return note or document or (len(path.parts) > 1 and path.parts[0] == "Artifacts")
 
 
-def _verify_git_inventory(vault_path, commit, paths, inventory, skip_dirs, required=()):
-    eligible = {p for p in paths if _vault_path_eligible(Path(p), skip_dirs)}
+def _verify_git_inventory(vault_path, commit, inventory, skip_dirs, protected, required=()):
+    """Classify every leaf of the commit; match every in-scope regular file to its blob."""
+    tree = subprocess.run(["git", "ls-tree", "-rz", commit, "--", "."], cwd=vault_path,
+                          capture_output=True, timeout=30)
+    if tree.returncode:
+        raise ValueError("Cannot enumerate the committed vault")
+    eligible = {}
+    excluded = {}
+    nonregular = set()
+    for item in tree.stdout.split(b"\0"):
+        if not item:
+            continue
+        meta, raw = item.split(b"\t", 1)
+        mode, _, oid = meta.split()
+        path = os.fsdecode(raw)
+        if mode not in (b"100644", b"100755"):
+            excluded[path] = "symlink" if mode == b"120000" else "nonregular Git entry"
+            nonregular.add(unicodedata.normalize("NFC", path))
+        elif not _vault_path_eligible(Path(path), skip_dirs):
+            excluded[path] = "outside configured inputs"
+        else:
+            eligible[path] = oid
+    # A working-tree file or directory replacing a committed link cannot enter
+    # the first import through its allowance for untracked local notes.
+    for path in inventory:
+        local = Path(unicodedata.normalize("NFC", path))
+        if nonregular and any(part.as_posix() in nonregular for part in (local, *local.parents)):
+            raise ValueError(f"Vault input conflicts with a nonregular committed path: {path}")
     normalized = {unicodedata.normalize("NFC", path) for path in eligible}
-    required = set(required)
     selected = {key: digest for key, digest in inventory.items()
                 if key in required or unicodedata.normalize("NFC", key) in normalized}
-    _verify_committed_additions(vault_path, selected, eligible, commit)
+    matches = _verify_committed_inputs(vault_path, selected, eligible)
+    for local, committed in matches.items():
+        if local in protected:
+            excluded[committed] = "protected identity_core"
+    return excluded
 
 
-def _resume_vault_snapshot(vault, state, head, hashes, inventory, skip_dirs):
+def _resume_vault_snapshot(vault, state, head, hashes, inventory, skip_dirs, protected):
     """Check an existing snapshot without updating receipts or advancing the commit."""
     pinned = state.commit_sha
     changed = hashes != state.source_hashes
     if any(hashes.get(key) != digest for key, digest in state.source_hashes.items()):
         raise ValueError("Previously recorded vault input changed; reconcile source and destination before retry")
     if not pinned:
+        if head:
+            # A vault first imported outside Git can acquire a repository later.
+            new = hashes.keys() - state.source_hashes.keys()
+            return head, _verify_git_inventory(vault, head, inventory, skip_dirs, protected, new)
         if changed:
             raise ValueError("Vault inputs changed since the checkpoint; reconcile the destination")
-        return None
+        return None, {}
     if not head:
         raise ValueError("Cannot verify the saved Git commit; restore access to the original repository")
 
     new = hashes.keys() - state.source_hashes.keys()
-    additions = []
     if head != pinned:
         additions = _git_new_files_since(vault, pinned, head, state.source_hashes)
         if state.phase != "done" and any(_vault_path_eligible(Path(path), skip_dirs) for path in additions):
             raise ValueError("Git inputs advanced during an incomplete restore; restore the pinned commit before retry")
         if not state.git_inventory_checked and state.phase == "done":
-            _verify_git_inventory(vault, pinned, _git_regular_files(vault, pinned), inventory, skip_dirs)
+            _verify_git_inventory(vault, pinned, inventory, skip_dirs, protected)
 
     # Eligibility depends on the file's contents. Plan from every in-scope tracked
     # path, including previously protected notes and symlinks replaced by files.
     # Also validate same-HEAD resumes: an older successful checkpoint may have
     # omitted a newly eligible path. Recover it once its committed bytes are present.
     target = head if state.phase == "done" else pinned
-    paths = _git_regular_files(vault, target)
-    if state.git_inventory_checked:
-        # Saved source hashes were compared above. The commit diff also guards
-        # those paths against edits hidden by a stale working copy.
-        paths.difference_update(state.source_hashes)
-        if target == head:
-            # A first import may have included an untracked path that has just been committed.
-            paths.update(additions)
-    _verify_git_inventory(vault, target, paths, inventory, skip_dirs, new)
-    return target
+    excluded = _verify_git_inventory(vault, target, inventory, skip_dirs, protected, new)
+    return target, excluded
 
 
 def _git_text_checkout_is_crlf(vault_path: Path, path: str) -> bool:
@@ -534,45 +548,61 @@ def _git_text_checkout_is_crlf(vault_path: Path, path: str) -> bool:
             and fields[:2] == [b"i/lf", b"w/crlf"] and b"attr/-text" not in fields and b"eol=lf" not in fields)
 
 
-def _verify_committed_additions(vault_path: Path, hashes: dict[str, str], git_paths: set[str], commit: str) -> None:
-    """Accept the pinned blob or its deterministic LF-to-CRLF expansion for text."""
-    new_paths = set(hashes)
+def _verify_committed_inputs(vault_path: Path, hashes: dict[str, str], blobs: dict[str, bytes]) -> dict[str, str]:
+    """Match planned bytes to immutable Git blobs, including permitted CRLF checkouts."""
     candidates: dict[str, list[str]] = {}
-    for path in git_paths - new_paths:
+    for path in blobs.keys() - hashes.keys():
         candidates.setdefault(unicodedata.normalize("NFC", path), []).append(path)
-    matched_paths = set()
-    for path, digest in hashes.items():
+    matches = {}
+    for path in hashes:
         stored_path = path
-        if path not in git_paths:
-            # On macOS Git may precompose a filename returned decomposed by readdir().
+        if path not in blobs:
             choices = candidates.pop(unicodedata.normalize("NFC", path), [])
             if (len(choices) != 1 or not (vault_path / choices[0]).is_file()
                     or not (vault_path / path).samefile(vault_path / choices[0])):
                 raise ValueError(f"Vault input is not a committed addition: {path}")
             stored_path = choices[0]
-        matched_paths.add(stored_path)
-        spec = f"{commit}:./{stored_path}"
-        with tempfile.TemporaryFile() as blob:
-            status = subprocess.run(["git", "cat-file", "blob", spec], cwd=vault_path, stdout=blob,
-                                    stderr=subprocess.PIPE, timeout=30)
-            if status.returncode:
+        matches[path] = stored_path
+    missing = blobs.keys() - matches.values()
+    if missing:
+        raise ValueError("Committed inputs missing from vault inventory: " + ", ".join(sorted(missing)))
+    if not matches:
+        return matches
+
+    # Request one immutable object at a time, using its ID so newlines in Git
+    # paths never enter the batch protocol. One Git process serves the whole vault.
+    with subprocess.Popen(["git", "cat-file", "--batch"], cwd=vault_path,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE) as reader:
+        for path, stored_path in matches.items():
+            oid = blobs[stored_path]
+            reader.stdin.write(oid + b"\n")
+            reader.stdin.flush()
+            header = reader.stdout.readline().split()
+            if len(header) != 3 or header[:2] != [oid, b"blob"] or not header[2].isdigit():
                 raise ValueError(f"Cannot read committed vault input: {path}")
-            blob.seek(0)
+            remaining = int(header[2])
             committed = hashlib.sha256()
             crlf = hashlib.sha256()
             plain_lf = True
-            for chunk in iter(lambda: blob.read(1024 * 1024), b""):
+            while remaining:
+                chunk = reader.stdout.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise ValueError(f"Incomplete Git blob for {path}")
+                remaining -= len(chunk)
                 committed.update(chunk)
                 plain_lf = plain_lf and b"\x00" not in chunk and b"\r" not in chunk
                 if plain_lf:
                     crlf.update(chunk.replace(b"\n", b"\r\n"))
+            if reader.stdout.read(1) != b"\n":
+                raise ValueError(f"Invalid Git blob response for {path}")
+            digest = hashes[path]
             if (committed.hexdigest() != digest and not (
                     plain_lf and crlf.hexdigest() == digest and _git_text_checkout_is_crlf(vault_path, stored_path))):
                 raise ValueError(f"Vault input differs from its committed bytes: {path}")
-
-    missing = git_paths - matched_paths
-    if missing:
-        raise ValueError("Committed additions missing from vault inventory: " + ", ".join(sorted(missing)))
+        reader.stdin.close()
+        if reader.wait(timeout=30):
+            raise ValueError("Git could not finish verifying the committed vault")
+    return matches
 
 
 # ---------------------------------------------------------------------------
@@ -4085,22 +4115,28 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
     checkpoint_dir = (args.checkpoint_dir or vault_path).resolve()
     checkpoint_path = checkpoint_dir / CHECKPOINT_FILENAME
     inventory = {**excluded_hashes, **hashes}
+    protected = excluded_hashes.keys() - hashes.keys()
     fresh = args.reset or not checkpoint_path.exists()
     baseline_sha = _git_head_sha(vault_path) if fresh else None
+    git_exclusions = {}
     if baseline_sha:
-        _verify_git_inventory(vault_path, baseline_sha, _git_regular_files(vault_path, baseline_sha),
-                              inventory, set(args.skip_dirs))
+        git_exclusions = _verify_git_inventory(vault_path, baseline_sha, inventory, set(args.skip_dirs), protected)
     if args.dry_run:
         if not fresh:
             saved = Checkpoint.load(checkpoint_path)
             if saved.pending_write is not None:
                 raise ValueError("Checkpoint contains an unconfirmed write; reconcile it before resuming")
-            _resume_vault_snapshot(vault_path, saved, _git_head_sha(vault_path), hashes, inventory, set(args.skip_dirs))
+            _, git_exclusions = _resume_vault_snapshot(vault_path, saved, _git_head_sha(vault_path), hashes,
+                                                       inventory, set(args.skip_dirs), protected)
+        for path, reason in sorted(git_exclusions.items()):
+            print(f"Git exclusion: {path} ({reason})")
         dry_run_report(notes, args, artifact_count=len(artifacts), document_count=len(documents))
         return int(bool(preview.unresolved_links))
     if preview.unresolved_links:
         raise ValueError(f"{len(preview.unresolved_links)} unresolved vault links; see warnings above")
     if not hashes and not checkpoint_path.exists():
+        for path, reason in sorted(git_exclusions.items()):
+            logger.info("Git exclusion: %s (%s)", path, reason)
         logger.info("Empty vault; there are no supported notes, artifacts or documents to import.")
         return 0
 
@@ -4184,8 +4220,11 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
                                  "or predates scoped checkpoints. Choose a new checkpoint directory "
                                  "after reconciling existing destination records.")
             changed_inventory = hashes != checkpoint.source_hashes
-            planned_sha = _resume_vault_snapshot(vault_path, checkpoint, current_sha, hashes, inventory, set(args.skip_dirs))
+            planned_sha, git_exclusions = _resume_vault_snapshot(vault_path, checkpoint, current_sha, hashes,
+                                                                inventory, set(args.skip_dirs), protected)
             save_baseline = bool(planned_sha and (planned_sha != checkpoint.commit_sha or not checkpoint.git_inventory_checked))
+            save_baseline = save_baseline or git_exclusions != checkpoint.git_exclusions
+            checkpoint.git_exclusions = git_exclusions
             checkpoint.commit_sha = planned_sha
             checkpoint.git_inventory_checked = bool(planned_sha)
             # R2 could mark a preflighted artifact skipped after its local bytes changed.
@@ -4205,6 +4244,7 @@ def run_vault_import(vault_path: Path, args: argparse.Namespace) -> int:
         else:
             if not fresh or current_sha != baseline_sha:
                 raise ValueError("Git baseline or checkpoint changed during preflight; retry the import")
+            checkpoint.git_exclusions = git_exclusions
             checkpoint.commit_sha = current_sha
             checkpoint.git_inventory_checked = True
         checkpoint.scope = scope

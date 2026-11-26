@@ -754,3 +754,126 @@ def test_initially_untracked_file_must_match_its_first_git_blob(monkeypatch, vau
     assert run(monkeypatch, vault) == 1
     assert (vault / importer.CHECKPOINT_FILENAME).read_bytes() == before
     assert destination.create_memory.call_count == 2
+
+
+@pytest.mark.parametrize("phase", ["fresh", "increment", "interrupted", "complete"])
+@pytest.mark.parametrize("unresolved", ["note.md", "empty.md", "protected.md", "Artifacts/nested/x.txt", "Documents/d.csv"])
+def test_every_committed_path_accounted_before_success_or_sibling_write(
+        monkeypatch, vault, destination, phase, unresolved):
+    """The oracle enumerates the actual commit separately from the importer."""
+    stored = {}
+
+    def create_memory(content, **kwargs):
+        dest = f"memory-{destination.create_memory.call_count}"
+        stored[dest] = content.encode()
+        return dest
+
+    def upload_document(name, data, **kwargs):
+        stored["document-1"] = data
+        return {"id": "document-1", "processing_status": "completed",
+                "embedding_progress": {"total": 1, "completed": 1, "pending": 0, "failed": 0}}
+
+    destination.create_memory.side_effect = create_memory
+    destination.create_artifact.side_effect = lambda path, text: stored.update({path: text.encode()})
+    destination.upload_document_bytes.side_effect = upload_document
+    _git_at(vault, "init")
+    (vault / "base.md").write_text("base")
+    _git_at(vault, "add", "base.md")
+    _git_at(vault, "commit", "-qm", "base")
+    if phase == "increment":
+        assert run(monkeypatch, vault) == 0
+    corpus = {"note.md": "body", "sibling.md": "sibling", "empty.md": "",
+              "protected.md": "---\ntype: identity_core\n---\nidentity",
+              "Artifacts/nested/x.txt": "artifact", "Documents/d.csv": "a,b",
+              "_templates/t.md": "template", "Documents/documents.json": "{}",
+              "ignored.bin": "other"}
+    for name, contents in corpus.items():
+        path = vault / name
+        path.parent.mkdir(exist_ok=True, parents=True)
+        path.write_text(contents)
+    (vault / "link.md").symlink_to("note.md")
+    _git_at(vault, "add", "--", *corpus, "link.md")
+    _git_at(vault, "commit", "-qm", "mixed tree")
+    head = _git_at(vault, "rev-parse", "HEAD")
+    tree = set(_git_at(vault, "ls-tree", "-r", "--name-only", head).splitlines())
+    if phase == "interrupted":
+        original = destination.create_memory.side_effect
+
+        def reject_sibling(**kwargs):
+            if kwargs["content"] == "sibling":
+                raise importer.APIError(422, "rejected", "/memories")
+            return original(**kwargs)
+        destination.create_memory.side_effect = reject_sibling
+        assert run(monkeypatch, vault) == 1
+        destination.create_memory.side_effect = original
+    elif phase == "complete":
+        assert run(monkeypatch, vault) == 0
+    cp = vault / importer.CHECKPOINT_FILENAME
+    original_state = cp.read_bytes() if cp.exists() else None
+    path = vault / unresolved
+    path.unlink()
+    writes = [destination.create_memory, destination.create_artifact, destination.upload_document_bytes,
+              destination.create_relationships_bulk]
+    counts = [method.call_count for method in writes]
+    for flags in [("--dry-run",), (), ()]:
+        assert run(monkeypatch, vault, *flags) == 1
+        assert (cp.read_bytes() if cp.exists() else None) == original_state
+        assert [method.call_count for method in writes] == counts
+    _git_at(vault, "restore", "--", unresolved)
+    assert run(monkeypatch, vault) == 0
+    state = importer.Checkpoint.load(cp)
+    assert state.phase == "done" and state.commit_sha == head
+    assert state.git_exclusions == {"link.md": "symlink", "protected.md": "protected identity_core",
+                                    "_templates/t.md": "outside configured inputs",
+                                    "Documents/documents.json": "outside configured inputs",
+                                    "ignored.bin": "outside configured inputs"}
+    assert state.memories["empty.md"] == importer.SKIP_EMPTY
+    assert all(not state.memories[name].startswith("__") for name in ["base.md", "sibling.md", "note.md"])
+    accounted = [*state.git_exclusions, *state.memories,
+                 *("Artifacts/" + p for p in state.vault_artifacts), *("Documents/" + p for p in state.documents)]
+    assert len(accounted) == len(set(accounted)) and set(accounted) == tree
+    assert state.vault_artifacts == {"nested/x.txt": "/nested/x.txt"} and state.documents == {"d.csv": "document-1"}
+    expected = {p: state.memories[p] for p in ["base.md", "sibling.md", "note.md"]}
+    expected["Artifacts/nested/x.txt"] = state.vault_artifacts["nested/x.txt"]
+    expected["Documents/d.csv"] = state.documents["d.csv"]
+    assert set(stored) == set(expected.values())
+    for path, receipt in expected.items():
+        assert stored[receipt] == subprocess.check_output(["git", "show", f"{head}:{path}"], cwd=vault)
+
+    counts = [method.call_count for method in writes]
+    assert run(monkeypatch, vault) == 0
+    assert [method.call_count for method in writes] == counts
+
+
+def test_tracked_symlink_cannot_be_imported_as_an_untracked_note(monkeypatch, vault, destination):
+    _git_at(vault, "init")
+    (vault / "sibling.md").write_text("sibling")
+    link = vault / "link.md"
+    link.symlink_to("sibling.md")
+    _git_at(vault, "add", ".")
+    _git_at(vault, "commit", "-qm", "baseline")
+    link.unlink()
+    link.write_text("uncommitted")
+    assert run(monkeypatch, vault, "--dry-run") == 1
+    assert run(monkeypatch, vault) == 1
+    destination.create_memory.assert_not_called()
+    assert not (vault / importer.CHECKPOINT_FILENAME).exists()
+
+
+def test_plain_vault_acquiring_git_checks_the_new_commit_before_noop(monkeypatch, vault, destination):
+    (vault / "base.md").write_text("base")
+    assert run(monkeypatch, vault) == 0
+    cp = vault / importer.CHECKPOINT_FILENAME
+    before = cp.read_bytes()
+    _git_at(vault, "init")
+    (vault / "missing.md").write_text("eligible")
+    _git_at(vault, "add", "base.md", "missing.md")
+    _git_at(vault, "commit", "-qm", "git baseline")
+    (vault / "missing.md").unlink()
+    assert run(monkeypatch, vault, "--dry-run") == 1
+    assert run(monkeypatch, vault) == 1
+    assert cp.read_bytes() == before and destination.create_memory.call_count == 1
+    _git_at(vault, "restore", "missing.md")
+    assert run(monkeypatch, vault) == 0
+    assert run(monkeypatch, vault) == 0
+    assert destination.create_memory.call_count == 2

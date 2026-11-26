@@ -7,7 +7,7 @@ This branch is for external review. Version 2.0.0 could exit successfully after 
 - Run a local preview before the first write. It reads the ZIP or vault and reports supported transformations and graph problems. A ZIP preview can succeed while reporting partial work that a restore will surface.
 - Keep the checkpoint when a restore stops. It binds receipts to the source and destination and records uncertain writes. A normal retry preserves confirmed successes.
 - A document upload can return HTTP 400 after creating a failed server record. Inspect the destination before any replay. A successful upload may still have pending vector indexing.
-- Git vault imports check committed inputs before writing siblings or advancing the checkpoint. If a previously imported path was edited, deleted or renamed, reconcile its destination record.
+- Git vault imports enumerate and check the complete committed tree before writing siblings or advancing the checkpoint. Preview and the saved checkpoint identify each excluded path and reason. If a previously imported path was edited, deleted or renamed, reconcile its destination record.
 
 ## Restoring with the candidate
 

@@ -334,7 +334,7 @@ A ZIP checkpoint records the SHA-256 of the archive and the verified destination
 
 ### Incremental import (git vaults)
 
-If the vault is in a git repository, the tool automatically tracks the commit SHA at import time. On the next run it detects files added since that commit and imports only the new ones — no flags needed.
+For a Git vault, preview and execution enumerate the selected commit directly. Every tracked input in scope is checked against its Git blob before writes. Preview lists committed exclusions by path and reason. The vault checkpoint records these under `git_exclusions`. Empty notes have an explicit skip receipt. An unreadable Git HEAD stops the import. The tool records the commit SHA at import time. On the next run it detects files added since that commit and imports only the new ones — no flags needed.
 
 ```bash
 # First run: imports everything, records commit SHA
