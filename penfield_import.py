@@ -412,23 +412,50 @@ class Checkpoint:
 # Git helpers for incremental import
 # ---------------------------------------------------------------------------
 
+def _enclosing_git_marker(vault_path: Path) -> Optional[Path]:
+    """Find the nearest .git file or directory within Git's discovery boundaries."""
+    folder = vault_path.resolve()
+    ceilings = set()
+    resolve_links = True
+    for entry in os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep):
+        if not entry:
+            # Git treats entries following an empty entry as already canonical.
+            resolve_links = False
+        elif os.path.isabs(entry):
+            ceilings.add(Path(entry).resolve() if resolve_links else Path(os.path.normpath(entry)))
+    across_devices = os.environ.get("GIT_DISCOVERY_ACROSS_FILESYSTEM", "").lower() not in {"", "0", "false", "no", "off"}
+    while True:
+        try:
+            (folder / ".git").lstat()  # Broken worktree pointers still identify a repository.
+        except FileNotFoundError:
+            pass
+        else:
+            return folder
+        parent = folder.parent
+        if parent == folder or parent in ceilings or (not across_devices and folder.stat().st_dev != parent.stat().st_dev):
+            return None
+        folder = parent
+
+
 def _git_head_sha(vault_path: Path) -> Optional[str]:
-    """Return the current HEAD commit SHA of the git repo containing *vault_path*,
-    or ``None`` if the path is not inside a git repository."""
+    """Return the enclosing worktree's commit, or None for a genuine plain directory."""
+    marker = _enclosing_git_marker(vault_path)
+    explicit = bool(os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"))
     try:
-        result = subprocess.run(["git", "rev-parse", "--verify", "HEAD^{commit}"], cwd=vault_path,
-                                capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            return result.stdout.strip()
-        inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=vault_path,
-                                capture_output=True, text=True, timeout=10, env={**os.environ, "LC_ALL": "C"})
-        outside = inside.returncode != 0 and "not a git repository" in inside.stderr
-        if not outside or os.path.lexists(vault_path / ".git"):
-            raise ValueError("Cannot verify Git HEAD for this vault; check its committed snapshot")
+        result = subprocess.run(["git", "rev-parse", "--show-toplevel", "--verify", "HEAD^{commit}"],
+                                cwd=vault_path, capture_output=True, timeout=10, env={**os.environ, "LC_ALL": "C"})
     except FileNotFoundError:
-        if any(os.path.lexists(folder / ".git") for folder in (vault_path, *vault_path.parents)):
+        if marker or explicit:
             raise ValueError("Git is required to verify this vault's committed snapshot")
-    return None
+        return None
+    if result.returncode == 0:
+        root, sha = result.stdout.removesuffix(b"\n").rsplit(b"\n", 1)
+        if marker and not marker.samefile(os.fsdecode(root)):
+            raise ValueError(f"Git resolved an outer repository past {marker}; repair the nearer repository")
+        return sha.decode("ascii")
+    if marker is None and not explicit and b"not a git repository" in result.stderr:
+        return None
+    raise ValueError(f"Cannot verify Git HEAD for {marker or vault_path}; check its committed snapshot")
 
 
 def _git_new_files_since(vault_path: Path, since_sha: str, end_sha: str = "HEAD",

@@ -877,3 +877,104 @@ def test_plain_vault_acquiring_git_checks_the_new_commit_before_noop(monkeypatch
     assert run(monkeypatch, vault) == 0
     assert run(monkeypatch, vault) == 0
     assert destination.create_memory.call_count == 2
+
+
+@pytest.mark.parametrize("existing", [True, False], ids=["saved", "fresh"])
+@pytest.mark.parametrize("valid_outer", [True, False], ids=["outer-repo", "plain-parent"])
+def test_damaged_enclosing_head_never_falls_back_to_plain_vault(tmp_path, monkeypatch, destination, existing, valid_outer):
+    # The ceiling makes the outermost directory independent of the host checkout.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    outer = tmp_path / "outer"
+    repo = outer / "inner"
+    vault = repo / "one" / "two"
+    vault.mkdir(parents=True)
+    if valid_outer:
+        _git_at(outer, "init")
+        (outer / "outer.md").write_text("outer")
+        _git_at(outer, "add", "outer.md")
+        _git_at(outer, "commit", "-qm", "outer")
+    _git_at(repo, "init")
+    (vault / "a.md").write_text("first")
+    _git_at(repo, "add", "one")
+    _git_at(repo, "commit", "-qm", "first")
+    state_dir = tmp_path / "state"
+    args = ("--checkpoint-dir", state_dir)
+    if existing:
+        assert run(monkeypatch, vault, *args) == 0
+    missing = vault / "b.md"
+    missing.write_text("second")
+    _git_at(repo, "add", "one/two/b.md")
+    _git_at(repo, "commit", "-qm", "second")
+    expected_head = _git_at(repo, "rev-parse", "HEAD")
+    missing.unlink()
+    head = repo / ".git" / "HEAD"
+    before_head = head.read_bytes()
+    head.write_bytes(b"unreadable reference\n")
+    cp = state_dir / importer.CHECKPOINT_FILENAME
+    before = cp.read_bytes() if cp.exists() else None
+    writes = destination.create_memory.call_count
+    for flags in [("--dry-run",), (), (), ("--reset", "--dry-run"), ("--reset",)]:
+        assert run(monkeypatch, vault, *args, *flags) == 1
+        assert (cp.read_bytes() if cp.exists() else None) == before
+        assert destination.create_memory.call_count == writes
+    head.write_bytes(before_head)
+    assert run(monkeypatch, vault, *args) == 1
+    assert destination.create_memory.call_count == writes
+    _git_at(vault, "restore", "b.md")
+    assert run(monkeypatch, vault, *args) == 0
+    assert run(monkeypatch, vault, *args) == 0
+    assert destination.create_memory.call_count == 2
+    state = importer.Checkpoint.load(cp)
+    assert state.commit_sha == expected_head and set(state.memories) == {"a.md", "b.md"}
+
+
+def test_plain_directory_below_discovery_ceiling_ignores_damaged_repo_above(tmp_path, monkeypatch, destination):
+    (tmp_path / ".git").mkdir()
+    ceiling = tmp_path / "boundary"
+    vault = ceiling / "nested"
+    vault.mkdir(parents=True)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(ceiling))
+    (vault / "a.md").write_text("plain")
+    assert run(monkeypatch, vault, "--dry-run") == 0
+    assert run(monkeypatch, vault) == 0
+    assert run(monkeypatch, vault) == 0
+    assert destination.create_memory.call_count == 1
+    assert importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME).commit_sha is None
+
+
+def test_nested_invalid_gitfile_stops_before_writes(tmp_path, monkeypatch, destination):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    checkout = tmp_path / "linked"
+    vault = checkout / "notes"
+    vault.mkdir(parents=True)
+    (checkout / ".git").write_text("gitdir: /nonexistent/penfield-worktree\n")
+    (vault / "a.md").write_text("visible")
+    assert run(monkeypatch, vault, "--dry-run") == 1
+    assert run(monkeypatch, vault) == 1
+    destination.create_memory.assert_not_called()
+    assert not (vault / importer.CHECKPOINT_FILENAME).exists()
+
+
+def test_nested_vault_in_linked_worktree_uses_its_own_commit(tmp_path, monkeypatch, destination):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    repo = tmp_path / "primary"
+    notes = repo / "vault"
+    notes.mkdir(parents=True)
+    _git_at(repo, "init")
+    (notes / "one.md").write_text("one")
+    _git_at(repo, "add", "vault")
+    _git_at(repo, "commit", "-qm", "primary")
+    linked = tmp_path / "linked"
+    _git_at(repo, "worktree", "add", "--detach", str(linked))
+    vault = linked / "vault"
+    (vault / "two.md").write_text("two")
+    _git_at(linked, "add", "vault")
+    _git_at(linked, "commit", "-qm", "linked-only input")
+    assert (linked / ".git").is_file()
+    assert run(monkeypatch, vault, "--dry-run") == 0
+    assert run(monkeypatch, vault) == 0
+    assert run(monkeypatch, vault) == 0
+    cp = importer.Checkpoint.load(vault / importer.CHECKPOINT_FILENAME)
+    assert cp.commit_sha == _git_at(linked, "rev-parse", "HEAD")
+    assert cp.commit_sha != _git_at(repo, "rev-parse", "HEAD")
+    assert set(cp.memories) == {"one.md", "two.md"} and destination.create_memory.call_count == 2

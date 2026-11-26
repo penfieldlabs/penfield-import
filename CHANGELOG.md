@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Stop preview, import and reset when a nested vault’s enclosing Git repository cannot supply a valid HEAD. Preserve prior receipts and reject an unrelated outer repository as the source of the commit.
+
 - Detect tracked notes becoming eligible after a protected baseline. Recover the omitted note with its committed bytes and the original checkpoint. Compare empty memory tag lists and explicitly declared generic document media types on fresh restores and upgrades.
 
 - Validate the entire ZIP before writes, including record identities, graph references and payload files. Preview preserves checkpoints, including when combined with `--reset`.

@@ -27,6 +27,12 @@ Context verification checks the name and member count in the checkpoint content 
 
 The source distribution includes the dev-only content reset helper. It inventories inactive memories, relationships, documents and recursive artifact paths. After an authorized reset it checks each original ID or path for HTTP 404 and enumerates the destination again. Usage and required scopes appear in the README.
 
+## Recovering a nested vault after a Git error
+
+R6 (`2f692df`) could import only the visible files from a nested vault when the enclosing repository’s HEAD was damaged, then record completion with no commit SHA. The candidate checks enclosing repository markers before accepting plain-directory mode. Preview, import and reset stop on an unverifiable enclosing repository.
+
+Repair the repository first. From the vault directory, check `git rev-parse --show-toplevel` and `git rev-parse --verify HEAD`. Confirm the intended commit, restore missing tracked inputs and rerun preview and import using the original checkpoint and destination. A matching earlier receipt is retained. A changed previously restored file requires reconciliation.
+
 ## Earlier review builds
 
 R5b (`0d00652`) could advance past a protected note whose committed version had become importable. With the correct working copy, repeating the import now restores the missing note and retains confirmed siblings. R5b could also accept unexpected tags on an untagged memory or a different media type for a document explicitly declared as `application/octet-stream`. Resuming rechecks affected receipts against the source.
