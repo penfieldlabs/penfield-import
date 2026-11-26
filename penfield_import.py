@@ -1896,7 +1896,8 @@ def build_relationship_list(
             }
 
     # Earlier restores could leave a rejected self-edge for a local heading.
-    checkpoint.failed_relationships = [key for key in checkpoint.failed_relationships if key not in local_navigation]
+    if local_navigation and checkpoint.pending_write is None:
+        checkpoint.failed_relationships = [key for key in checkpoint.failed_relationships if key not in local_navigation]
     return list(result.items())
 
 
